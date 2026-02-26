@@ -1,55 +1,117 @@
-# es-errors <sup>[![Version Badge][npm-version-svg]][package-url]</sup>
+# fresh
 
-[![github actions][actions-image]][actions-url]
-[![coverage][codecov-image]][codecov-url]
-[![License][license-image]][license-url]
-[![Downloads][downloads-image]][downloads-url]
+[![NPM Version][npm-image]][npm-url]
+[![NPM Downloads][downloads-image]][downloads-url]
+[![Node.js Version][node-version-image]][node-version-url]
+[![Build Status][ci-image]][ci-url]
+[![Test Coverage][coveralls-image]][coveralls-url]
 
-[![npm badge][npm-badge-png]][package-url]
+HTTP response freshness testing
 
-A simple cache for a few of the JS Error constructors.
+## Installation
+
+This is a [Node.js](https://nodejs.org/en/) module available through the
+[npm registry](https://www.npmjs.com/). Installation is done using the
+[`npm install` command](https://docs.npmjs.com/getting-started/installing-npm-packages-locally):
+
+```
+$ npm install fresh
+```
+
+## API
+
+```js
+var fresh = require('fresh')
+```
+
+### fresh(reqHeaders, resHeaders)
+
+Check freshness of the response using request and response headers.
+
+When the response is still "fresh" in the client's cache `true` is
+returned, otherwise `false` is returned to indicate that the client
+cache is now stale and the full response should be sent.
+
+When a client sends the `Cache-Control: no-cache` request header to
+indicate an end-to-end reload request, this module will return `false`
+to make handling these requests transparent.
+
+## Known Issues
+
+This module is designed to only follow the HTTP specifications, not
+to work-around all kinda of client bugs (especially since this module
+typically does not receive enough information to understand what the
+client actually is).
+
+There is a known issue that in certain versions of Safari, Safari
+will incorrectly make a request that allows this module to validate
+freshness of the resource even when Safari does not have a
+representation of the resource in the cache. The module
+[jumanji](https://www.npmjs.com/package/jumanji) can be used in
+an Express application to work-around this issue and also provides
+links to further reading on this Safari bug.
 
 ## Example
 
+### API usage
+
+<!-- eslint-disable no-redeclare -->
+
 ```js
-const assert = require('assert');
+var reqHeaders = { 'if-none-match': '"foo"' }
+var resHeaders = { etag: '"bar"' }
+fresh(reqHeaders, resHeaders)
+// => false
 
-const Base = require('es-errors');
-const Eval = require('es-errors/eval');
-const Range = require('es-errors/range');
-const Ref = require('es-errors/ref');
-const Syntax = require('es-errors/syntax');
-const Type = require('es-errors/type');
-const URI = require('es-errors/uri');
-
-assert.equal(Base, Error);
-assert.equal(Eval, EvalError);
-assert.equal(Range, RangeError);
-assert.equal(Ref, ReferenceError);
-assert.equal(Syntax, SyntaxError);
-assert.equal(Type, TypeError);
-assert.equal(URI, URIError);
+var reqHeaders = { 'if-none-match': '"foo"' }
+var resHeaders = { etag: '"foo"' }
+fresh(reqHeaders, resHeaders)
+// => true
 ```
 
-## Tests
-Simply clone the repo, `npm install`, and run `npm test`
+### Using with Node.js http server
 
-## Security
+```js
+var fresh = require('fresh')
+var http = require('http')
 
-Please email [@ljharb](https://github.com/ljharb) or see https://tidelift.com/security if you have a potential security vulnerability to report.
+var server = http.createServer(function (req, res) {
+  // perform server logic
+  // ... including adding ETag / Last-Modified response headers
 
-[package-url]: https://npmjs.org/package/es-errors
-[npm-version-svg]: https://versionbadg.es/ljharb/es-errors.svg
-[deps-svg]: https://david-dm.org/ljharb/es-errors.svg
-[deps-url]: https://david-dm.org/ljharb/es-errors
-[dev-deps-svg]: https://david-dm.org/ljharb/es-errors/dev-status.svg
-[dev-deps-url]: https://david-dm.org/ljharb/es-errors#info=devDependencies
-[npm-badge-png]: https://nodei.co/npm/es-errors.png?downloads=true&stars=true
-[license-image]: https://img.shields.io/npm/l/es-errors.svg
-[license-url]: LICENSE
-[downloads-image]: https://img.shields.io/npm/dm/es-errors.svg
-[downloads-url]: https://npm-stat.com/charts.html?package=es-errors
-[codecov-image]: https://codecov.io/gh/ljharb/es-errors/branch/main/graphs/badge.svg
-[codecov-url]: https://app.codecov.io/gh/ljharb/es-errors/
-[actions-image]: https://img.shields.io/endpoint?url=https://github-actions-badge-u3jn4tfpocch.runkit.sh/ljharb/es-errors
-[actions-url]: https://github.com/ljharb/es-errors/actions
+  if (isFresh(req, res)) {
+    // client has a fresh copy of resource
+    res.statusCode = 304
+    res.end()
+    return
+  }
+
+  // send the resource
+  res.statusCode = 200
+  res.end('hello, world!')
+})
+
+function isFresh (req, res) {
+  return fresh(req.headers, {
+    etag: res.getHeader('ETag'),
+    'last-modified': res.getHeader('Last-Modified')
+  })
+}
+
+server.listen(3000)
+```
+
+## License
+
+[MIT](LICENSE)
+
+[ci-image]: https://img.shields.io/github/workflow/status/jshttp/fresh/ci/master?label=ci
+[ci-url]: https://github.com/jshttp/fresh/actions/workflows/ci.yml
+[npm-image]: https://img.shields.io/npm/v/fresh.svg
+[npm-url]: https://npmjs.org/package/fresh
+[node-version-image]: https://img.shields.io/node/v/fresh.svg
+[node-version-url]: https://nodejs.org/en/
+[coveralls-image]: https://img.shields.io/coveralls/jshttp/fresh/master.svg
+[coveralls-url]: https://coveralls.io/r/jshttp/fresh?branch=master
+[downloads-image]: https://img.shields.io/npm/dm/fresh.svg
+[downloads-url]: https://npmjs.org/package/fresh

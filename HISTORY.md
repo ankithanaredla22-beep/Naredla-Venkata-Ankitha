@@ -1,108 +1,80 @@
-0.6.3 / 2022-01-22
+2.0.0 - 2024-09-04
+==========
+ * Drop support for Node.js <18
+
+1.0.0 - 2024-09-04
+==========
+
+  * Drop support for Node.js below 0.8
+  * Fix: Ignore `If-Modified-Since` in the presence of `If-None-Match`, according to [spec](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.3-5). Fixes [#35](https://github.com/jshttp/fresh/issues/35)
+
+0.5.2 / 2017-09-13
 ==================
 
-  * Revert "Lazy-load modules from main entry point"
+  * Fix regression matching multiple ETags in `If-None-Match`
+  * perf: improve `If-None-Match` token parsing
 
-0.6.2 / 2019-04-29
+0.5.1 / 2017-09-11
 ==================
 
-  * Fix sorting charset, encoding, and language with extra parameters
+  * Fix handling of modified headers with invalid dates
+  * perf: improve ETag match loop
 
-0.6.1 / 2016-05-02
+0.5.0 / 2017-02-21
 ==================
 
-  * perf: improve `Accept` parsing speed
-  * perf: improve `Accept-Charset` parsing speed
-  * perf: improve `Accept-Encoding` parsing speed
-  * perf: improve `Accept-Language` parsing speed
+  * Fix incorrect result when `If-None-Match` has both `*` and ETags
+  * Fix weak `ETag` matching to match spec
+  * perf: delay reading header values until needed
+  * perf: skip checking modified time if ETag check failed
+  * perf: skip parsing `If-None-Match` when no `ETag` header
+  * perf: use `Date.parse` instead of `new Date`
 
-0.6.0 / 2015-09-29
+0.4.0 / 2017-02-05
 ==================
 
-  * Fix including type extensions in parameters in `Accept` parsing
-  * Fix parsing `Accept` parameters with quoted equals
-  * Fix parsing `Accept` parameters with quoted semicolons
-  * Lazy-load modules from main entry point
-  * perf: delay type concatenation until needed
+  * Fix false detection of `no-cache` request directive
   * perf: enable strict mode
   * perf: hoist regular expressions
-  * perf: remove closures getting spec properties
-  * perf: remove a closure from media type parsing
-  * perf: remove property delete from media type parsing
+  * perf: remove duplicate conditional
+  * perf: remove unnecessary boolean coercions
 
-0.5.3 / 2015-05-10
+0.3.0 / 2015-05-12
 ==================
 
-  * Fix media type parameter matching to be case-insensitive
+  * Add weak `ETag` matching support
 
-0.5.2 / 2015-05-06
+0.2.4 / 2014-09-07
 ==================
 
-  * Fix comparing media types with quoted values
-  * Fix splitting media types with quoted commas
-
-0.5.1 / 2015-02-14
-==================
-
-  * Fix preference sorting to be stable for long acceptable lists
-
-0.5.0 / 2014-12-18
-==================
-
-  * Fix list return order when large accepted list
-  * Fix missing identity encoding when q=0 exists
-  * Remove dynamic building of Negotiator class
-
-0.4.9 / 2014-10-14
-==================
-
-  * Fix error when media type has invalid parameter
-
-0.4.8 / 2014-09-28
-==================
-
-  * Fix all negotiations to be case-insensitive
-  * Stable sort preferences of same quality according to client order
   * Support Node.js 0.6
 
-0.4.7 / 2014-06-24
+0.2.3 / 2014-09-07
 ==================
 
-  * Handle invalid provided languages
-  * Handle invalid provided media types
+  * Move repository to jshttp
 
-0.4.6 / 2014-06-11
+0.2.2 / 2014-02-19
 ==================
 
-  *  Order by specificity when quality is the same
+  * Revert "Fix for blank page on Safari reload"
 
-0.4.5 / 2014-05-29
+0.2.1 / 2014-01-29
 ==================
 
-  * Fix regression in empty header handling
+  * Fix for blank page on Safari reload
 
-0.4.4 / 2014-05-29
+0.2.0 / 2013-08-11
 ==================
 
-  * Fix behaviors when headers are not present
+  * Return stale for `Cache-Control: no-cache`
 
-0.4.3 / 2014-04-16
+0.1.0 / 2012-06-15
 ==================
 
-  * Handle slashes on media params correctly
+  * Add `If-None-Match: *` support
 
-0.4.2 / 2014-02-28
+0.0.1 / 2012-06-10
 ==================
 
-  * Fix media type sorting
-  * Handle media types params strictly
-
-0.4.1 / 2014-01-16
-==================
-
-  * Use most specific matches
-
-0.4.0 / 2014-01-09
-==================
-
-  * Remove preferred prefix from methods
+  * Initial release
