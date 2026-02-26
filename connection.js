@@ -1,572 +1,1844 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.CryptoConnection = exports.SizedMessageTransform = exports.Connection = void 0;
-exports.hasSessionSupport = hasSessionSupport;
-const stream_1 = require("stream");
-const timers_1 = require("timers");
-const bson_1 = require("../bson");
-const constants_1 = require("../constants");
-const error_1 = require("../error");
-const mongo_logger_1 = require("../mongo_logger");
-const mongo_types_1 = require("../mongo_types");
-const read_preference_1 = require("../read_preference");
-const common_1 = require("../sdam/common");
-const sessions_1 = require("../sessions");
-const timeout_1 = require("../timeout");
-const utils_1 = require("../utils");
-const command_monitoring_events_1 = require("./command_monitoring_events");
-const commands_1 = require("./commands");
-const stream_description_1 = require("./stream_description");
-const compression_1 = require("./wire_protocol/compression");
-const on_data_1 = require("./wire_protocol/on_data");
-const responses_1 = require("./wire_protocol/responses");
-const shared_1 = require("./wire_protocol/shared");
-/** @internal */
-function hasSessionSupport(conn) {
-    const description = conn.description;
-    return description.logicalSessionTimeoutMinutes != null;
+'use strict';
+
+/*!
+ * Module dependencies.
+ */
+
+const ChangeStream = require('./cursor/changeStream');
+const EventEmitter = require('events').EventEmitter;
+const Schema = require('./schema');
+const STATES = require('./connectionState');
+const MongooseBulkWriteError = require('./error/bulkWriteError');
+const MongooseError = require('./error/index');
+const ServerSelectionError = require('./error/serverSelection');
+const SyncIndexesError = require('./error/syncIndexes');
+const applyPlugins = require('./helpers/schema/applyPlugins');
+const clone = require('./helpers/clone');
+const driver = require('./driver');
+const get = require('./helpers/get');
+const getDefaultBulkwriteResult = require('./helpers/getDefaultBulkwriteResult');
+const immediate = require('./helpers/immediate');
+const utils = require('./utils');
+const CreateCollectionsError = require('./error/createCollectionsError');
+const castBulkWrite = require('./helpers/model/castBulkWrite');
+const { modelSymbol } = require('./helpers/symbols');
+const isPromise = require('./helpers/isPromise');
+const decorateBulkWriteResult = require('./helpers/model/decorateBulkWriteResult');
+
+const arrayAtomicsSymbol = require('./helpers/symbols').arrayAtomicsSymbol;
+const sessionNewDocuments = require('./helpers/symbols').sessionNewDocuments;
+
+/**
+ * A list of authentication mechanisms that don't require a password for authentication.
+ * This is used by the authMechanismDoesNotRequirePassword method.
+ *
+ * @api private
+ */
+const noPasswordAuthMechanisms = [
+  'MONGODB-X509'
+];
+
+/**
+ * Connection constructor
+ *
+ * For practical reasons, a Connection equals a Db.
+ *
+ * @param {Mongoose} base a mongoose instance
+ * @inherits NodeJS EventEmitter https://nodejs.org/api/events.html#class-eventemitter
+ * @event `connecting`: Emitted when `connection.openUri()` is executed on this connection.
+ * @event `connected`: Emitted when this connection successfully connects to the db. May be emitted _multiple_ times in `reconnected` scenarios.
+ * @event `open`: Emitted after we `connected` and `onOpen` is executed on all of this connection's models.
+ * @event `disconnecting`: Emitted when `connection.close()` was executed.
+ * @event `disconnected`: Emitted after getting disconnected from the db.
+ * @event `close`: Emitted after we `disconnected` and `onClose` executed on all of this connection's models.
+ * @event `reconnected`: Emitted after we `connected` and subsequently `disconnected`, followed by successfully another successful connection.
+ * @event `error`: Emitted when an error occurs on this connection.
+ * @event `operation-start`: Emitted when a call to the MongoDB Node.js driver, like a `find()` or `insertOne()`, happens on any collection tied to this connection.
+ * @event `operation-end`: Emitted when a call to the MongoDB Node.js driver, like a `find()` or `insertOne()`, either succeeds or errors.
+ * @api public
+ */
+
+function Connection(base) {
+  this.base = base;
+  this.collections = {};
+  this.models = {};
+  this.config = {};
+  this.replica = false;
+  this.options = null;
+  this.otherDbs = []; // FIXME: To be replaced with relatedDbs
+  this.relatedDbs = {}; // Hashmap of other dbs that share underlying connection
+  this.states = STATES;
+  this._readyState = STATES.disconnected;
+  this._closeCalled = false;
+  this._hasOpened = false;
+  this.plugins = [];
+  if (typeof base === 'undefined' || !base.connections.length) {
+    this.id = 0;
+  } else {
+    this.id = base.nextConnectionId;
+  }
+
+  // Internal queue of objects `{ fn, ctx, args }` that Mongoose calls when this connection is successfully
+  // opened. In `onOpen()`, Mongoose calls every entry in `_queue` and empties the queue.
+  this._queue = [];
 }
-function streamIdentifier(stream, options) {
-    if (options.proxyHost) {
-        // If proxy options are specified, the properties of `stream` itself
-        // will not accurately reflect what endpoint this is connected to.
-        return options.hostAddress.toString();
+
+/*!
+ * Inherit from EventEmitter
+ */
+
+Object.setPrototypeOf(Connection.prototype, EventEmitter.prototype);
+
+/**
+ * Connection ready state
+ *
+ * - 0 = disconnected
+ * - 1 = connected
+ * - 2 = connecting
+ * - 3 = disconnecting
+ *
+ * Each state change emits its associated event name.
+ *
+ * #### Example:
+ *
+ *     conn.on('connected', callback);
+ *     conn.on('disconnected', callback);
+ *
+ * @property readyState
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Object.defineProperty(Connection.prototype, 'readyState', {
+  get: function() {
+    // If connection thinks it is connected, but we haven't received a heartbeat in 2 heartbeat intervals,
+    // that likely means the connection is stale (potentially due to frozen AWS Lambda container)
+    if (
+      this._readyState === STATES.connected &&
+      this._lastHeartbeatAt != null &&
+      // LoadBalanced topology (behind haproxy, including Atlas serverless instances) don't use heartbeats,
+      // so we can't use this check in that case.
+      this.client?.topology?.s?.description?.type !== 'LoadBalanced' &&
+      typeof this.client?.topology?.s?.description?.heartbeatFrequencyMS === 'number' &&
+      Date.now() - this._lastHeartbeatAt >= this.client.topology.s.description.heartbeatFrequencyMS * 2) {
+      return STATES.disconnected;
     }
-    const { remoteAddress, remotePort } = stream;
-    if (typeof remoteAddress === 'string' && typeof remotePort === 'number') {
-        return utils_1.HostAddress.fromHostPort(remoteAddress, remotePort).toString();
+    return this._readyState;
+  },
+  set: function(val) {
+    if (!(val in STATES)) {
+      throw new Error('Invalid connection state: ' + val);
     }
-    return (0, utils_1.uuidV4)().toString('hex');
+
+    if (this._readyState !== val) {
+      this._readyState = val;
+      // [legacy] loop over the otherDbs on this connection and change their state
+      for (const db of this.otherDbs) {
+        db.readyState = val;
+      }
+
+      if (STATES.connected === val) {
+        this._hasOpened = true;
+      }
+
+      this.emit(STATES[val]);
+    }
+  }
+});
+
+/**
+ * Gets the value of the option `key`. Equivalent to `conn.options[key]`
+ *
+ * #### Example:
+ *
+ *     conn.get('test'); // returns the 'test' value
+ *
+ * @param {String} key
+ * @method get
+ * @api public
+ */
+
+Connection.prototype.get = function getOption(key) {
+  if (this.config.hasOwnProperty(key)) {
+    return this.config[key];
+  }
+
+  return get(this.options, key);
+};
+
+/**
+ * Sets the value of the option `key`. Equivalent to `conn.options[key] = val`
+ *
+ * Supported options include:
+ *
+ * - `maxTimeMS`: Set [`maxTimeMS`](https://mongoosejs.com/docs/api/query.html#Query.prototype.maxTimeMS()) for all queries on this connection.
+ * - 'debug': If `true`, prints the operations mongoose sends to MongoDB to the console. If a writable stream is passed, it will log to that stream, without colorization. If a callback function is passed, it will receive the collection name, the method name, then all arugments passed to the method. For example, if you wanted to replicate the default logging, you could output from the callback `Mongoose: ${collectionName}.${methodName}(${methodArgs.join(', ')})`.
+ *
+ * #### Example:
+ *
+ *     conn.set('test', 'foo');
+ *     conn.get('test'); // 'foo'
+ *     conn.options.test; // 'foo'
+ *
+ * @param {String} key
+ * @param {Any} val
+ * @method set
+ * @api public
+ */
+
+Connection.prototype.set = function setOption(key, val) {
+  if (this.config.hasOwnProperty(key)) {
+    this.config[key] = val;
+    return val;
+  }
+
+  this.options = this.options || {};
+  this.options[key] = val;
+  return val;
+};
+
+/**
+ * A hash of the collections associated with this connection
+ *
+ * @property collections
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.collections;
+
+/**
+ * The name of the database this connection points to.
+ *
+ * #### Example:
+ *
+ *     mongoose.createConnection('mongodb://127.0.0.1:27017/mydb').name; // "mydb"
+ *
+ * @property name
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.name;
+
+/**
+ * A [POJO](https://masteringjs.io/tutorials/fundamentals/pojo) containing
+ * a map from model names to models. Contains all models that have been
+ * added to this connection using [`Connection#model()`](https://mongoosejs.com/docs/api/connection.html#Connection.prototype.model()).
+ *
+ * #### Example:
+ *
+ *     const conn = mongoose.createConnection();
+ *     const Test = conn.model('Test', mongoose.Schema({ name: String }));
+ *
+ *     Object.keys(conn.models).length; // 1
+ *     conn.models.Test === Test; // true
+ *
+ * @property models
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.models;
+
+/**
+ * A number identifier for this connection. Used for debugging when
+ * you have [multiple connections](https://mongoosejs.com/docs/connections.html#multiple_connections).
+ *
+ * #### Example:
+ *
+ *     // The default connection has `id = 0`
+ *     mongoose.connection.id; // 0
+ *
+ *     // If you create a new connection, Mongoose increments id
+ *     const conn = mongoose.createConnection();
+ *     conn.id; // 1
+ *
+ * @property id
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.id;
+
+/**
+ * The plugins that will be applied to all models created on this connection.
+ *
+ * #### Example:
+ *
+ *     const db = mongoose.createConnection('mongodb://127.0.0.1:27017/mydb');
+ *     db.plugin(() => console.log('Applied'));
+ *     db.plugins.length; // 1
+ *
+ *     db.model('Test', new Schema({})); // Prints "Applied"
+ *
+ * @property plugins
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Object.defineProperty(Connection.prototype, 'plugins', {
+  configurable: false,
+  enumerable: true,
+  writable: true
+});
+
+/**
+ * The host name portion of the URI. If multiple hosts, such as a replica set,
+ * this will contain the first host name in the URI
+ *
+ * #### Example:
+ *
+ *     mongoose.createConnection('mongodb://127.0.0.1:27017/mydb').host; // "127.0.0.1"
+ *
+ * @property host
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Object.defineProperty(Connection.prototype, 'host', {
+  configurable: true,
+  enumerable: true,
+  writable: true
+});
+
+/**
+ * The port portion of the URI. If multiple hosts, such as a replica set,
+ * this will contain the port from the first host name in the URI.
+ *
+ * #### Example:
+ *
+ *     mongoose.createConnection('mongodb://127.0.0.1:27017/mydb').port; // 27017
+ *
+ * @property port
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Object.defineProperty(Connection.prototype, 'port', {
+  configurable: true,
+  enumerable: true,
+  writable: true
+});
+
+/**
+ * The username specified in the URI
+ *
+ * #### Example:
+ *
+ *     mongoose.createConnection('mongodb://val:psw@127.0.0.1:27017/mydb').user; // "val"
+ *
+ * @property user
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Object.defineProperty(Connection.prototype, 'user', {
+  configurable: true,
+  enumerable: true,
+  writable: true
+});
+
+/**
+ * The password specified in the URI
+ *
+ * #### Example:
+ *
+ *     mongoose.createConnection('mongodb://val:psw@127.0.0.1:27017/mydb').pass; // "psw"
+ *
+ * @property pass
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Object.defineProperty(Connection.prototype, 'pass', {
+  configurable: true,
+  enumerable: true,
+  writable: true
+});
+
+/**
+ * The mongodb.Db instance, set when the connection is opened
+ *
+ * @property db
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.db;
+
+/**
+ * The MongoClient instance this connection uses to talk to MongoDB. Mongoose automatically sets this property
+ * when the connection is opened.
+ *
+ * @property client
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.client;
+
+/**
+ * A hash of the global options that are associated with this connection
+ *
+ * @property config
+ * @memberOf Connection
+ * @instance
+ * @api public
+ */
+
+Connection.prototype.config;
+
+/**
+ * Helper for `createCollection()`. Will explicitly create the given collection
+ * with specified options. Used to create [capped collections](https://www.mongodb.com/docs/manual/core/capped-collections/)
+ * and [views](https://www.mongodb.com/docs/manual/core/views/) from mongoose.
+ *
+ * Options are passed down without modification to the [MongoDB driver's `createCollection()` function](https://mongodb.github.io/node-mongodb-native/4.9/classes/Db.html#createCollection)
+ *
+ * @method createCollection
+ * @param {string} collection The collection to create
+ * @param {Object} [options] see [MongoDB driver docs](https://mongodb.github.io/node-mongodb-native/4.9/classes/Db.html#createCollection)
+ * @return {Promise}
+ * @api public
+ */
+
+Connection.prototype.createCollection = async function createCollection(collection, options) {
+  if (typeof options === 'function' || (arguments.length >= 3 && typeof arguments[2] === 'function')) {
+    throw new MongooseError('Connection.prototype.createCollection() no longer accepts a callback');
+  }
+
+  await this._waitForConnect();
+
+  return this.db.createCollection(collection, options);
+};
+
+/**
+ * _Requires MongoDB Server 8.0 or greater_. Executes bulk write operations across multiple models in a single operation.
+ * You must specify the `model` for each operation: Mongoose will use `model` for casting and validation, as well as
+ * determining which collection to apply the operation to.
+ *
+ * #### Example:
+ *     const Test = mongoose.model('Test', new Schema({ name: String }));
+ *
+ *     await db.bulkWrite([
+ *       { model: Test, name: 'insertOne', document: { name: 'test1' } }, // Can specify model as a Model class...
+ *       { model: 'Test', name: 'insertOne', document: { name: 'test2' } } // or as a model name
+ *     ], { ordered: false });
+ *
+ * @method bulkWrite
+ * @param {Array} ops
+ * @param {Object} [options]
+ * @param {Boolean} [options.ordered] If false, perform unordered operations. If true, perform ordered operations.
+ * @param {Session} [options.session] The session to use for the operation.
+ * @return {Promise}
+ * @see MongoDB https://www.mongodb.com/docs/manual/reference/command/bulkWrite/#mongodb-dbcommand-dbcmd.bulkWrite
+ * @api public
+ */
+
+
+Connection.prototype.bulkWrite = async function bulkWrite(ops, options) {
+  await this._waitForConnect();
+  options = options || {};
+
+  const ordered = options.ordered == null ? true : options.ordered;
+  const asyncLocalStorage = this.base.transactionAsyncLocalStorage?.getStore();
+  if ((!options || !options.hasOwnProperty('session')) && asyncLocalStorage?.session != null) {
+    options = { ...options, session: asyncLocalStorage.session };
+  }
+
+  const now = this.base.now();
+
+  let res = null;
+  if (ordered) {
+    const opsToSend = [];
+    for (const op of ops) {
+      if (typeof op.model !== 'string' && !op.model?.[modelSymbol]) {
+        throw new MongooseError('Must specify model in Connection.prototype.bulkWrite() operations');
+      }
+      const Model = op.model[modelSymbol] ? op.model : this.model(op.model);
+
+      if (op.name == null) {
+        throw new MongooseError('Must specify operation name in Connection.prototype.bulkWrite()');
+      }
+      if (!castBulkWrite.cast.hasOwnProperty(op.name)) {
+        throw new MongooseError(`Unrecognized bulkWrite() operation name ${op.name}`);
+      }
+
+      await castBulkWrite.cast[op.name](Model, op, options, now);
+      opsToSend.push({ ...op, namespace: Model.namespace() });
+    }
+
+    res = await this.client.bulkWrite(opsToSend, options);
+  } else {
+    const validOps = [];
+    const validOpIndexes = [];
+    let validationErrors = [];
+    const asyncValidations = [];
+    const results = [];
+    for (let i = 0; i < ops.length; ++i) {
+      const op = ops[i];
+      if (typeof op.model !== 'string' && !op.model?.[modelSymbol]) {
+        const error = new MongooseError('Must specify model in Connection.prototype.bulkWrite() operations');
+        validationErrors.push({ index: i, error: error });
+        results[i] = error;
+        continue;
+      }
+      let Model;
+      try {
+        Model = op.model[modelSymbol] ? op.model : this.model(op.model);
+      } catch (error) {
+        validationErrors.push({ index: i, error: error });
+        continue;
+      }
+      if (op.name == null) {
+        const error = new MongooseError('Must specify operation name in Connection.prototype.bulkWrite()');
+        validationErrors.push({ index: i, error: error });
+        results[i] = error;
+        continue;
+      }
+      if (!castBulkWrite.cast.hasOwnProperty(op.name)) {
+        const error = new MongooseError(`Unrecognized bulkWrite() operation name ${op.name}`);
+        validationErrors.push({ index: i, error: error });
+        results[i] = error;
+        continue;
+      }
+
+      let maybePromise = null;
+      try {
+        maybePromise = castBulkWrite.cast[op.name](Model, op, options, now);
+      } catch (error) {
+        validationErrors.push({ index: i, error: error });
+        results[i] = error;
+        continue;
+      }
+      if (isPromise(maybePromise)) {
+        asyncValidations.push(
+          maybePromise.then(
+            () => {
+              validOps.push({ ...op, namespace: Model.namespace() });
+              validOpIndexes.push(i);
+            },
+            error => {
+              validationErrors.push({ index: i, error: error });
+              results[i] = error;
+            }
+          )
+        );
+      } else {
+        validOps.push({ ...op, namespace: Model.namespace() });
+        validOpIndexes.push(i);
+      }
+    }
+
+    if (asyncValidations.length > 0) {
+      await Promise.all(asyncValidations);
+    }
+
+    validationErrors = validationErrors.
+      sort((v1, v2) => v1.index - v2.index).
+      map(v => v.error);
+
+    if (validOps.length === 0) {
+      if (options.throwOnValidationError && validationErrors.length) {
+        throw new MongooseBulkWriteError(
+          validationErrors,
+          results,
+          res,
+          'bulkWrite'
+        );
+      }
+      const BulkWriteResult = this.base.driver.get().BulkWriteResult;
+      const res = new BulkWriteResult(getDefaultBulkwriteResult(), false);
+      return decorateBulkWriteResult(res, validationErrors, results);
+    }
+
+    let error;
+    [res, error] = await this.client.bulkWrite(validOps, options).
+      then(res => ([res, null])).
+      catch(err => ([null, err]));
+
+    for (let i = 0; i < validOpIndexes.length; ++i) {
+      results[validOpIndexes[i]] = null;
+    }
+    if (error) {
+      if (validationErrors.length > 0) {
+        decorateBulkWriteResult(error, validationErrors, results);
+        error.mongoose = error.mongoose || {};
+        error.mongoose.validationErrors = validationErrors;
+      }
+    }
+
+    if (validationErrors.length > 0) {
+      if (options.throwOnValidationError) {
+        throw new MongooseBulkWriteError(
+          validationErrors,
+          results,
+          res,
+          'bulkWrite'
+        );
+      } else {
+        decorateBulkWriteResult(res, validationErrors, results);
+      }
+    }
+  }
+
+  return res;
+};
+
+/**
+ * Calls `createCollection()` on a models in a series.
+ *
+ * @method createCollections
+ * @param {Boolean} continueOnError When true, will continue to create collections and create a new error class for the collections that errored.
+ * @returns {Promise}
+ * @api public
+ */
+
+Connection.prototype.createCollections = async function createCollections(options = {}) {
+  const result = {};
+  const errorsMap = { };
+
+  const { continueOnError } = options;
+  delete options.continueOnError;
+  for (const model of Object.values(this.models)) {
+    try {
+      result[model.modelName] = await model.createCollection({});
+    } catch (err) {
+      if (!continueOnError) {
+        errorsMap[model.modelName] = err;
+        break;
+      } else {
+        result[model.modelName] = err;
+      }
+    }
+  }
+
+  if (!continueOnError && Object.keys(errorsMap).length) {
+    const message = Object.entries(errorsMap).map(([modelName, err]) => `${modelName}: ${err.message}`).join(', ');
+    const createCollectionsError = new CreateCollectionsError(message, errorsMap);
+    throw createCollectionsError;
+  }
+  return result;
+};
+
+/**
+ * A convenience wrapper for `connection.client.withSession()`.
+ *
+ * #### Example:
+ *
+ *     await conn.withSession(async session => {
+ *       const doc = await TestModel.findOne().session(session);
+ *     });
+ *
+ * @method withSession
+ * @param {Function} executor called with 1 argument: a `ClientSession` instance
+ * @return {Promise} resolves to the return value of the executor function
+ * @api public
+ */
+
+Connection.prototype.withSession = async function withSession(executor) {
+  if (arguments.length === 0) {
+    throw new Error('Please provide an executor function');
+  }
+  return await this.client.withSession(executor);
+};
+
+/**
+ * _Requires MongoDB >= 3.6.0._ Starts a [MongoDB session](https://www.mongodb.com/docs/manual/release-notes/3.6/#client-sessions)
+ * for benefits like causal consistency, [retryable writes](https://www.mongodb.com/docs/manual/core/retryable-writes/),
+ * and [transactions](https://thecodebarbarian.com/a-node-js-perspective-on-mongodb-4-transactions.html).
+ *
+ * #### Example:
+ *
+ *     const session = await conn.startSession();
+ *     let doc = await Person.findOne({ name: 'Ned Stark' }, null, { session });
+ *     await doc.deleteOne();
+ *     // `doc` will always be null, even if reading from a replica set
+ *     // secondary. Without causal consistency, it is possible to
+ *     // get a doc back from the below query if the query reads from a
+ *     // secondary that is experiencing replication lag.
+ *     doc = await Person.findOne({ name: 'Ned Stark' }, null, { session, readPreference: 'secondary' });
+ *
+ *
+ * @method startSession
+ * @param {Object} [options] see the [mongodb driver options](https://mongodb.github.io/node-mongodb-native/4.9/classes/MongoClient.html#startSession)
+ * @param {Boolean} [options.causalConsistency=true] set to false to disable causal consistency
+ * @return {Promise<ClientSession>} promise that resolves to a MongoDB driver `ClientSession`
+ * @api public
+ */
+
+Connection.prototype.startSession = async function startSession(options) {
+  if (arguments.length >= 2 && typeof arguments[1] === 'function') {
+    throw new MongooseError('Connection.prototype.startSession() no longer accepts a callback');
+  }
+
+  await this._waitForConnect();
+
+  const session = this.client.startSession(options);
+  return session;
+};
+
+/**
+ * _Requires MongoDB >= 3.6.0._ Executes the wrapped async function
+ * in a transaction. Mongoose will commit the transaction if the
+ * async function executes successfully and attempt to retry if
+ * there was a retriable error.
+ *
+ * Calls the MongoDB driver's [`session.withTransaction()`](https://mongodb.github.io/node-mongodb-native/4.9/classes/ClientSession.html#withTransaction),
+ * but also handles resetting Mongoose document state as shown below.
+ *
+ * #### Example:
+ *
+ *     const doc = new Person({ name: 'Will Riker' });
+ *     await db.transaction(async function setRank(session) {
+ *       doc.rank = 'Captain';
+ *       await doc.save({ session });
+ *       doc.isNew; // false
+ *
+ *       // Throw an error to abort the transaction
+ *       throw new Error('Oops!');
+ *     },{ readPreference: 'primary' }).catch(() => {});
+ *
+ *     // true, `transaction()` reset the document's state because the
+ *     // transaction was aborted.
+ *     doc.isNew;
+ *
+ * @method transaction
+ * @param {Function} fn Function to execute in a transaction
+ * @param {mongodb.TransactionOptions} [options] Optional settings for the transaction
+ * @return {Promise<Any>} promise that is fulfilled if Mongoose successfully committed the transaction, or rejects if the transaction was aborted or if Mongoose failed to commit the transaction. If fulfilled, the promise resolves to a MongoDB command result.
+ * @api public
+ */
+
+Connection.prototype.transaction = function transaction(fn, options) {
+  return this.startSession().then(session => {
+    session[sessionNewDocuments] = new Map();
+    return session.withTransaction(() => _wrapUserTransaction(fn, session, this.base), options).
+      then(res => {
+        delete session[sessionNewDocuments];
+        return res;
+      }).
+      catch(err => {
+        delete session[sessionNewDocuments];
+        throw err;
+      }).
+      finally(() => {
+        session.endSession().catch(() => {});
+      });
+  });
+};
+
+/*!
+ * Reset document state in between transaction retries re: gh-13698
+ */
+
+async function _wrapUserTransaction(fn, session, mongoose) {
+  try {
+    const res = mongoose.transactionAsyncLocalStorage == null
+      ? await fn(session)
+      : await new Promise(resolve => {
+        mongoose.transactionAsyncLocalStorage.run(
+          { session },
+          () => resolve(fn(session))
+        );
+      });
+    return res;
+  } catch (err) {
+    _resetSessionDocuments(session);
+    throw err;
+  }
 }
-/** @internal */
-class Connection extends mongo_types_1.TypedEventEmitter {
-    constructor(stream, options) {
-        super();
-        this.lastHelloMS = -1;
-        this.helloOk = false;
-        this.delayedTimeoutId = null;
-        /** Indicates that the connection (including underlying TCP socket) has been closed. */
-        this.closed = false;
-        this.clusterTime = null;
-        this.error = null;
-        this.dataEvents = null;
-        this.on('error', utils_1.noop);
-        this.socket = stream;
-        this.id = options.id;
-        this.address = streamIdentifier(stream, options);
-        this.socketTimeoutMS = options.socketTimeoutMS ?? 0;
-        this.monitorCommands = options.monitorCommands;
-        this.serverApi = options.serverApi;
-        this.mongoLogger = options.mongoLogger;
-        this.established = false;
-        this.description = new stream_description_1.StreamDescription(this.address, options);
-        this.generation = options.generation;
-        this.lastUseTime = (0, utils_1.now)();
-        this.messageStream = this.socket
-            .on('error', this.onSocketError.bind(this))
-            .pipe(new SizedMessageTransform({ connection: this }))
-            .on('error', this.onTransformError.bind(this));
-        this.socket.on('close', this.onClose.bind(this));
-        this.socket.on('timeout', this.onTimeout.bind(this));
-        this.messageStream.pause();
+
+/*!
+ * If transaction was aborted, we need to reset newly inserted documents' `isNew`.
+ */
+function _resetSessionDocuments(session) {
+  for (const doc of session[sessionNewDocuments].keys()) {
+    const state = session[sessionNewDocuments].get(doc);
+    if (state.hasOwnProperty('isNew')) {
+      doc.$isNew = state.isNew;
     }
-    get hello() {
-        return this.description.hello;
+    if (state.hasOwnProperty('versionKey')) {
+      doc.set(doc.schema.options.versionKey, state.versionKey);
     }
-    // the `connect` method stores the result of the handshake hello on the connection
-    set hello(response) {
-        this.description.receiveResponse(response);
-        Object.freeze(this.description);
+
+    if (state.modifiedPaths.length > 0 && doc.$__.activePaths.states.modify == null) {
+      doc.$__.activePaths.states.modify = {};
     }
-    get serviceId() {
-        return this.hello?.serviceId;
+    for (const path of state.modifiedPaths) {
+      const currentState = doc.$__.activePaths.paths[path];
+      if (currentState != null) {
+        delete doc.$__.activePaths[currentState][path];
+      }
+      doc.$__.activePaths.paths[path] = 'modify';
+      doc.$__.activePaths.states.modify[path] = true;
     }
-    get loadBalanced() {
-        return this.description.loadBalanced;
+
+    for (const path of state.atomics.keys()) {
+      const val = doc.$__getValue(path);
+      if (val == null) {
+        continue;
+      }
+      val[arrayAtomicsSymbol] = state.atomics.get(path);
     }
-    get idleTime() {
-        return (0, utils_1.calculateDurationInMs)(this.lastUseTime);
+  }
+}
+
+/**
+ * Helper for `dropCollection()`. Will delete the given collection, including
+ * all documents and indexes.
+ *
+ * @method dropCollection
+ * @param {string} collection The collection to delete
+ * @return {Promise}
+ * @api public
+ */
+
+Connection.prototype.dropCollection = async function dropCollection(collection) {
+  if (arguments.length >= 2 && typeof arguments[1] === 'function') {
+    throw new MongooseError('Connection.prototype.dropCollection() no longer accepts a callback');
+  }
+
+  await this._waitForConnect();
+
+  return this.db.dropCollection(collection);
+};
+
+/**
+ * Waits for connection to be established, so the connection has a `client`
+ *
+ * @param {Boolean} [noTimeout=false] if set, don't put a timeout on the operation. Used internally so `mongoose.model()` doesn't leave open handles.
+ * @return Promise
+ * @api private
+ */
+
+Connection.prototype._waitForConnect = async function _waitForConnect(noTimeout) {
+  if ((this.readyState === STATES.connecting || this.readyState === STATES.disconnected) && this._shouldBufferCommands()) {
+    const bufferTimeoutMS = this._getBufferTimeoutMS();
+    let timeout = null;
+    let timedOut = false;
+    // The element that this function pushes onto `_queue`, stored to make it easy to remove later
+    const queueElement = {};
+
+    // Mongoose executes all elements in `_queue` when initial connection succeeds in `onOpen()`.
+    const waitForConnectPromise = new Promise(resolve => {
+      queueElement.fn = resolve;
+      this._queue.push(queueElement);
+    });
+
+    if (noTimeout) {
+      await waitForConnectPromise;
+    } else {
+      await Promise.race([
+        waitForConnectPromise,
+        new Promise(resolve => {
+          timeout = setTimeout(
+            () => {
+              timedOut = true;
+              resolve();
+            },
+            bufferTimeoutMS
+          );
+        })
+      ]);
     }
-    get hasSessionSupport() {
-        return this.description.logicalSessionTimeoutMinutes != null;
+
+    if (timedOut) {
+      const index = this._queue.indexOf(queueElement);
+      if (index !== -1) {
+        this._queue.splice(index, 1);
+      }
+      const message = 'Connection operation buffering timed out after ' + bufferTimeoutMS + 'ms';
+      throw new MongooseError(message);
+    } else if (timeout != null) {
+      // Not strictly necessary, but avoid the extra overhead of creating a new MongooseError
+      // in case of success
+      clearTimeout(timeout);
     }
-    get supportsOpMsg() {
-        return (this.description != null &&
-            (0, utils_1.maxWireVersion)(this) >= 6 &&
-            !this.description.__nodejs_mock_server__);
+  }
+};
+
+/*!
+ * Get the default buffer timeout for this connection
+ */
+
+Connection.prototype._getBufferTimeoutMS = function _getBufferTimeoutMS() {
+  if (this.config.bufferTimeoutMS != null) {
+    return this.config.bufferTimeoutMS;
+  }
+  if (this.base != null && this.base.get('bufferTimeoutMS') != null) {
+    return this.base.get('bufferTimeoutMS');
+  }
+  return 10000;
+};
+
+/**
+ * Helper for MongoDB Node driver's `listCollections()`.
+ * Returns an array of collection objects.
+ *
+ * @method listCollections
+ * @return {Promise<Collection[]>}
+ * @api public
+ */
+
+Connection.prototype.listCollections = async function listCollections() {
+  await this._waitForConnect();
+
+  const cursor = this.db.listCollections();
+  return await cursor.toArray();
+};
+
+/**
+ * Helper for MongoDB Node driver's `listDatabases()`.
+ * Returns an object with a `databases` property that contains an
+ * array of database objects.
+ *
+ * #### Example:
+ *     const { databases } = await mongoose.connection.listDatabases();
+ *     databases; // [{ name: 'mongoose_test', sizeOnDisk: 0, empty: false }]
+ *
+ * @method listCollections
+ * @return {Promise<{ databases: Array<{ name: string }> }>}
+ * @api public
+ */
+
+Connection.prototype.listDatabases = async function listDatabases() {
+  // Implemented in `lib/drivers/node-mongodb-native/connection.js`
+  throw new MongooseError('listDatabases() not implemented by driver');
+};
+
+/**
+ * Helper for `dropDatabase()`. Deletes the given database, including all
+ * collections, documents, and indexes.
+ *
+ * #### Example:
+ *
+ *     const conn = mongoose.createConnection('mongodb://127.0.0.1:27017/mydb');
+ *     // Deletes the entire 'mydb' database
+ *     await conn.dropDatabase();
+ *
+ * @method dropDatabase
+ * @return {Promise}
+ * @api public
+ */
+
+Connection.prototype.dropDatabase = async function dropDatabase() {
+  if (arguments.length >= 1 && typeof arguments[0] === 'function') {
+    throw new MongooseError('Connection.prototype.dropDatabase() no longer accepts a callback');
+  }
+
+  await this._waitForConnect();
+
+  // If `dropDatabase()` is called, this model's collection will not be
+  // init-ed. It is sufficiently common to call `dropDatabase()` after
+  // `mongoose.connect()` but before creating models that we want to
+  // support this. See gh-6796
+  for (const model of Object.values(this.models)) {
+    delete model.$init;
+  }
+
+  return this.db.dropDatabase();
+};
+
+/*!
+ * ignore
+ */
+
+Connection.prototype._shouldBufferCommands = function _shouldBufferCommands() {
+  if (this.config.bufferCommands != null) {
+    return this.config.bufferCommands;
+  }
+  if (this.base.get('bufferCommands') != null) {
+    return this.base.get('bufferCommands');
+  }
+  return true;
+};
+
+/**
+ * error
+ *
+ * Graceful error handling, passes error to callback
+ * if available, else emits error on the connection.
+ *
+ * @param {Error} err
+ * @param {Function} callback optional
+ * @emits "error" Emits the `error` event with the given `err`, unless a callback is specified
+ * @returns {Promise|null} Returns a rejected Promise if no `callback` is given.
+ * @api private
+ */
+
+Connection.prototype.error = function error(err, callback) {
+  if (callback) {
+    callback(err);
+    return null;
+  }
+  if (this.listeners('error').length > 0) {
+    this.emit('error', err);
+  }
+  return Promise.reject(err);
+};
+
+/**
+ * Called when the connection is opened
+ *
+ * @emits "open"
+ * @api private
+ */
+
+Connection.prototype.onOpen = function() {
+  this.readyState = STATES.connected;
+
+  for (const d of this._queue) {
+    d.fn.apply(d.ctx, d.args);
+  }
+  this._queue = [];
+
+  // avoid having the collection subscribe to our event emitter
+  // to prevent 0.3 warning
+  for (const i in this.collections) {
+    if (utils.object.hasOwnProperty(this.collections, i)) {
+      this.collections[i].onOpen();
     }
-    get shouldEmitAndLogCommand() {
-        return ((this.monitorCommands ||
-            (this.established &&
-                !this.authContext?.reauthenticating &&
-                this.mongoLogger?.willLog(mongo_logger_1.MongoLoggableComponent.COMMAND, mongo_logger_1.SeverityLevel.DEBUG))) ??
-            false);
+  }
+
+  this.emit('open');
+};
+
+/**
+ * Opens the connection with a URI using `MongoClient.connect()`.
+ *
+ * @param {String} uri The URI to connect with.
+ * @param {Object} [options] Passed on to [`MongoClient.connect`](https://mongodb.github.io/node-mongodb-native/4.9/classes/MongoClient.html#connect-1)
+ * @param {Boolean} [options.bufferCommands=true] Mongoose specific option. Set to false to [disable buffering](https://mongoosejs.com/docs/faq.html#callback_never_executes) on all models associated with this connection.
+ * @param {Number} [options.bufferTimeoutMS=10000] Mongoose specific option. If `bufferCommands` is true, Mongoose will throw an error after `bufferTimeoutMS` if the operation is still buffered.
+ * @param {String} [options.dbName] The name of the database we want to use. If not provided, use database name from connection string.
+ * @param {String} [options.user] username for authentication, equivalent to `options.auth.user`. Maintained for backwards compatibility.
+ * @param {String} [options.pass] password for authentication, equivalent to `options.auth.password`. Maintained for backwards compatibility.
+ * @param {Number} [options.maxPoolSize=100] The maximum number of sockets the MongoDB driver will keep open for this connection. Keep in mind that MongoDB only allows one operation per socket at a time, so you may want to increase this if you find you have a few slow queries that are blocking faster queries from proceeding. See [Slow Trains in MongoDB and Node.js](https://thecodebarbarian.com/slow-trains-in-mongodb-and-nodejs).
+ * @param {Number} [options.minPoolSize=0] The minimum number of sockets the MongoDB driver will keep open for this connection. Keep in mind that MongoDB only allows one operation per socket at a time, so you may want to increase this if you find you have a few slow queries that are blocking faster queries from proceeding. See [Slow Trains in MongoDB and Node.js](https://thecodebarbarian.com/slow-trains-in-mongodb-and-nodejs).
+ * @param {Number} [options.serverSelectionTimeoutMS] If `useUnifiedTopology = true`, the MongoDB driver will try to find a server to send any given operation to, and keep retrying for `serverSelectionTimeoutMS` milliseconds before erroring out. If not set, the MongoDB driver defaults to using `30000` (30 seconds).
+ * @param {Number} [options.heartbeatFrequencyMS] If `useUnifiedTopology = true`, the MongoDB driver sends a heartbeat every `heartbeatFrequencyMS` to check on the status of the connection. A heartbeat is subject to `serverSelectionTimeoutMS`, so the MongoDB driver will retry failed heartbeats for up to 30 seconds by default. Mongoose only emits a `'disconnected'` event after a heartbeat has failed, so you may want to decrease this setting to reduce the time between when your server goes down and when Mongoose emits `'disconnected'`. We recommend you do **not** set this setting below 1000, too many heartbeats can lead to performance degradation.
+ * @param {Boolean} [options.autoIndex=true] Mongoose-specific option. Set to false to disable automatic index creation for all models associated with this connection.
+ * @param {Class} [options.promiseLibrary] Sets the [underlying driver's promise library](https://mongodb.github.io/node-mongodb-native/4.9/interfaces/MongoClientOptions.html#promiseLibrary).
+ * @param {Number} [options.socketTimeoutMS=0] How long the MongoDB driver will wait before killing a socket due to inactivity _after initial connection_. A socket may be inactive because of either no activity or a long-running operation. `socketTimeoutMS` defaults to 0, which means Node.js will not time out the socket due to inactivity. This option is passed to [Node.js `socket#setTimeout()` function](https://nodejs.org/api/net.html#net_socket_settimeout_timeout_callback) after the MongoDB driver successfully completes.
+ * @param {Number} [options.family=0] Passed transparently to [Node.js' `dns.lookup()`](https://nodejs.org/api/dns.html#dns_dns_lookup_hostname_options_callback) function. May be either `0, `4`, or `6`. `4` means use IPv4 only, `6` means use IPv6 only, `0` means try both.
+ * @param {Boolean} [options.autoCreate=false] Set to `true` to make Mongoose automatically call `createCollection()` on every model created on this connection.
+ * @returns {Promise<Connection>}
+ * @api public
+ */
+
+Connection.prototype.openUri = async function openUri(uri, options) {
+  if (this.readyState === STATES.connecting || this.readyState === STATES.connected) {
+    if (this._connectionString === uri) {
+      return this;
     }
-    markAvailable() {
-        this.lastUseTime = (0, utils_1.now)();
+  }
+
+  this._closeCalled = false;
+
+  // Internal option to skip `await this.$initialConnection` in
+  // this function for `createConnection()`. Because otherwise
+  // `createConnection()` would have an uncatchable error.
+  let _fireAndForget = false;
+  if (options && '_fireAndForget' in options) {
+    _fireAndForget = options._fireAndForget;
+    delete options._fireAndForget;
+  }
+
+  try {
+    _validateArgs.apply(arguments);
+  } catch (err) {
+    if (_fireAndForget) {
+      throw err;
     }
-    onSocketError(cause) {
-        this.onError(new error_1.MongoNetworkError(cause.message, { cause }));
-    }
-    onTransformError(error) {
-        this.onError(error);
-    }
-    onError(error) {
-        this.cleanup(error);
-    }
-    onClose() {
-        const message = `connection ${this.id} to ${this.address} closed`;
-        this.cleanup(new error_1.MongoNetworkError(message));
-    }
-    onTimeout() {
-        this.delayedTimeoutId = (0, timers_1.setTimeout)(() => {
-            const message = `connection ${this.id} to ${this.address} timed out`;
-            const beforeHandshake = this.hello == null;
-            this.cleanup(new error_1.MongoNetworkTimeoutError(message, { beforeHandshake }));
-        }, 1).unref(); // No need for this timer to hold the event loop open
-    }
-    destroy() {
-        if (this.closed) {
-            return;
-        }
-        // load balanced mode requires that these listeners remain on the connection
-        // after cleanup on timeouts, errors or close so we remove them before calling
-        // cleanup.
-        this.removeAllListeners(Connection.PINNED);
-        this.removeAllListeners(Connection.UNPINNED);
-        const message = `connection ${this.id} to ${this.address} closed`;
-        this.cleanup(new error_1.MongoNetworkError(message));
-    }
-    /**
-     * A method that cleans up the connection.  When `force` is true, this method
-     * forcibly destroys the socket.
-     *
-     * If an error is provided, any in-flight operations will be closed with the error.
-     *
-     * This method does nothing if the connection is already closed.
-     */
-    cleanup(error) {
-        if (this.closed) {
-            return;
-        }
-        this.socket.destroy();
-        this.error = error;
-        this.dataEvents?.throw(error).then(undefined, utils_1.squashError);
-        this.closed = true;
-        this.emit(Connection.CLOSE);
-    }
-    prepareCommand(db, command, options) {
-        let cmd = { ...command };
-        const readPreference = (0, shared_1.getReadPreference)(options);
-        const session = options?.session;
-        let clusterTime = this.clusterTime;
-        if (this.serverApi) {
-            const { version, strict, deprecationErrors } = this.serverApi;
-            cmd.apiVersion = version;
-            if (strict != null)
-                cmd.apiStrict = strict;
-            if (deprecationErrors != null)
-                cmd.apiDeprecationErrors = deprecationErrors;
-        }
-        if (this.hasSessionSupport && session) {
-            if (session.clusterTime &&
-                clusterTime &&
-                session.clusterTime.clusterTime.greaterThan(clusterTime.clusterTime)) {
-                clusterTime = session.clusterTime;
-            }
-            const sessionError = (0, sessions_1.applySession)(session, cmd, options);
-            if (sessionError)
-                throw sessionError;
-        }
-        else if (session?.explicit) {
-            throw new error_1.MongoCompatibilityError('Current topology does not support sessions');
-        }
-        // if we have a known cluster time, gossip it
-        if (clusterTime) {
-            cmd.$clusterTime = clusterTime;
-        }
-        // For standalone, drivers MUST NOT set $readPreference.
-        if (this.description.type !== common_1.ServerType.Standalone) {
-            if (!(0, shared_1.isSharded)(this) &&
-                !this.description.loadBalanced &&
-                this.supportsOpMsg &&
-                options.directConnection === true &&
-                readPreference?.mode === 'primary') {
-                // For mongos and load balancers with 'primary' mode, drivers MUST NOT set $readPreference.
-                // For all other types with a direct connection, if the read preference is 'primary'
-                // (driver sets 'primary' as default if no read preference is configured),
-                // the $readPreference MUST be set to 'primaryPreferred'
-                // to ensure that any server type can handle the request.
-                cmd.$readPreference = read_preference_1.ReadPreference.primaryPreferred.toJSON();
-            }
-            else if ((0, shared_1.isSharded)(this) && !this.supportsOpMsg && readPreference?.mode !== 'primary') {
-                // When sending a read operation via OP_QUERY and the $readPreference modifier,
-                // the query MUST be provided using the $query modifier.
-                cmd = {
-                    $query: cmd,
-                    $readPreference: readPreference.toJSON()
-                };
-            }
-            else if (readPreference?.mode !== 'primary') {
-                // For mode 'primary', drivers MUST NOT set $readPreference.
-                // For all other read preference modes (i.e. 'secondary', 'primaryPreferred', ...),
-                // drivers MUST set $readPreference
-                cmd.$readPreference = readPreference.toJSON();
-            }
-        }
-        const commandOptions = {
-            numberToSkip: 0,
-            numberToReturn: -1,
-            checkKeys: false,
-            // This value is not overridable
-            secondaryOk: readPreference.secondaryOk(),
-            ...options
+    this.$initialConnection = Promise.reject(err);
+    throw err;
+  }
+
+  this.$initialConnection = this.createClient(uri, options).
+    then(() => this).
+    catch(err => {
+      this.readyState = STATES.disconnected;
+      if (this.listeners('error').length > 0) {
+        immediate(() => this.emit('error', err));
+      }
+      throw err;
+    });
+
+  for (const model of Object.values(this.models)) {
+    // Errors handled internally, so safe to ignore error
+    model.init().catch(function $modelInitNoop() {});
+  }
+
+  // `createConnection()` calls this `openUri()` function without
+  // awaiting on the result, so we set this option to rely on
+  // `asPromise()` to handle any errors.
+  if (_fireAndForget) {
+    return this;
+  }
+
+  try {
+    await this.$initialConnection;
+  } catch (err) {
+    throw _handleConnectionErrors(err);
+  }
+
+  return this;
+};
+
+/**
+ * Listen to events in the Connection
+ *
+ * @param {String} event The event to listen on
+ * @param {Function} callback
+ * @see Connection#readyState https://mongoosejs.com/docs/api/connection.html#Connection.prototype.readyState
+ *
+ * @method on
+ * @instance
+ * @memberOf Connection
+ * @api public
+ */
+
+// Treat `on('error')` handlers as handling the initialConnection promise
+// to avoid uncaught exceptions when using `on('error')`. See gh-14377.
+Connection.prototype.on = function on(event, callback) {
+  if (event === 'error' && this.$initialConnection) {
+    this.$initialConnection.catch(() => {});
+  }
+  return EventEmitter.prototype.on.call(this, event, callback);
+};
+
+/**
+ * Listen to a event once in the Connection
+ *
+ * @param {String} event The event to listen on
+ * @param {Function} callback
+ * @see Connection#readyState https://mongoosejs.com/docs/api/connection.html#Connection.prototype.readyState
+ *
+ * @method once
+ * @instance
+ * @memberOf Connection
+ * @api public
+ */
+
+// Treat `on('error')` handlers as handling the initialConnection promise
+// to avoid uncaught exceptions when using `on('error')`. See gh-14377.
+Connection.prototype.once = function on(event, callback) {
+  if (event === 'error' && this.$initialConnection) {
+    this.$initialConnection.catch(() => {});
+  }
+  return EventEmitter.prototype.once.call(this, event, callback);
+};
+
+/*!
+ * ignore
+ */
+
+function _validateArgs(uri, options, callback) {
+  if (typeof options === 'function' && callback == null) {
+    throw new MongooseError('Connection.prototype.openUri() no longer accepts a callback');
+  } else if (typeof callback === 'function') {
+    throw new MongooseError('Connection.prototype.openUri() no longer accepts a callback');
+  }
+}
+
+/*!
+ * ignore
+ */
+
+function _handleConnectionErrors(err) {
+  if (err?.name === 'MongoServerSelectionError') {
+    const originalError = err;
+    err = new ServerSelectionError();
+    err.assimilateError(originalError);
+  }
+
+  return err;
+}
+
+/**
+ * Destroy the connection. Similar to [`.close`](https://mongoosejs.com/docs/api/connection.html#Connection.prototype.close()),
+ * but also removes the connection from Mongoose's `connections` list and prevents the
+ * connection from ever being re-opened.
+ *
+ * @param {Boolean} [force]
+ * @returns {Promise}
+ */
+
+Connection.prototype.destroy = async function destroy(force) {
+  if (typeof force === 'function' || (arguments.length === 2 && typeof arguments[1] === 'function')) {
+    throw new MongooseError('Connection.prototype.destroy() no longer accepts a callback');
+  }
+
+  if (force != null && typeof force === 'object') {
+    this.$wasForceClosed = !!force.force;
+  } else {
+    this.$wasForceClosed = !!force;
+  }
+
+  return this._close(force, true);
+};
+
+/**
+ * Closes the connection
+ *
+ * @param {Boolean} [force] optional
+ * @return {Promise}
+ * @api public
+ */
+
+Connection.prototype.close = async function close(force) {
+  if (typeof force === 'function' || (arguments.length === 2 && typeof arguments[1] === 'function')) {
+    throw new MongooseError('Connection.prototype.close() no longer accepts a callback');
+  }
+
+  if (force != null && typeof force === 'object') {
+    this.$wasForceClosed = !!force.force;
+  } else {
+    this.$wasForceClosed = !!force;
+  }
+
+  if (this._lastHeartbeatAt != null) {
+    this._lastHeartbeatAt = null;
+  }
+
+  for (const model of Object.values(this.models)) {
+    // If manually disconnecting, make sure to clear each model's `$init`
+    // promise, so Mongoose knows to re-run `init()` in case the
+    // connection is re-opened. See gh-12047.
+    delete model.$init;
+  }
+
+  return this._close(force, false);
+};
+
+/**
+ * Handles closing the connection
+ *
+ * @param {Boolean} force
+ * @param {Boolean} destroy
+ * @returns {Connection} this
+ * @api private
+ */
+Connection.prototype._close = async function _close(force, destroy) {
+  const _this = this;
+  const closeCalled = this._closeCalled;
+  this._closeCalled = true;
+  this._destroyCalled = destroy;
+  if (this.client != null) {
+    this.client._closeCalled = true;
+    this.client._destroyCalled = destroy;
+  }
+
+  const conn = this;
+  switch (this.readyState) {
+    case STATES.disconnected:
+      if (destroy && this.base.connections.indexOf(conn) !== -1) {
+        this.base.connections.splice(this.base.connections.indexOf(conn), 1);
+      }
+      if (!closeCalled) {
+        await this.doClose(force);
+        this.onClose(force);
+      }
+      break;
+
+    case STATES.connected:
+      this.readyState = STATES.disconnecting;
+      await this.doClose(force);
+      if (destroy && _this.base.connections.indexOf(conn) !== -1) {
+        this.base.connections.splice(this.base.connections.indexOf(conn), 1);
+      }
+      this.onClose(force);
+
+      break;
+    case STATES.connecting:
+      return new Promise((resolve, reject) => {
+        const _rerunClose = () => {
+          this.removeListener('open', _rerunClose);
+          this.removeListener('error', _rerunClose);
+          if (destroy) {
+            this.destroy(force).then(resolve, reject);
+          } else {
+            this.close(force).then(resolve, reject);
+          }
         };
-        options.timeoutContext?.addMaxTimeMSToCommand(cmd, options);
-        const message = this.supportsOpMsg
-            ? new commands_1.OpMsgRequest(db, cmd, commandOptions)
-            : new commands_1.OpQueryRequest(db, cmd, commandOptions);
-        return message;
+
+        this.once('open', _rerunClose);
+        this.once('error', _rerunClose);
+      });
+
+    case STATES.disconnecting:
+      return new Promise(resolve => {
+        this.once('close', () => {
+          if (destroy && this.base.connections.indexOf(conn) !== -1) {
+            this.base.connections.splice(this.base.connections.indexOf(conn), 1);
+          }
+          resolve();
+        });
+      });
+  }
+
+  return this;
+};
+
+/**
+ * Abstract method that drivers must implement.
+ *
+ * @api private
+ */
+
+Connection.prototype.doClose = function doClose() {
+  throw new Error('Connection#doClose unimplemented by driver');
+};
+
+/**
+ * Called when the connection closes
+ *
+ * @emits "close"
+ * @api private
+ */
+
+Connection.prototype.onClose = function onClose(force) {
+  this.readyState = STATES.disconnected;
+
+  // avoid having the collection subscribe to our event emitter
+  // to prevent 0.3 warning
+  for (const i in this.collections) {
+    if (utils.object.hasOwnProperty(this.collections, i)) {
+      this.collections[i].onClose(force);
     }
-    async *sendWire(message, options, responseType) {
-        this.throwIfAborted();
-        const timeout = options.socketTimeoutMS ??
-            options?.timeoutContext?.getSocketTimeoutMS() ??
-            this.socketTimeoutMS;
-        this.socket.setTimeout(timeout);
-        try {
-            await this.writeCommand(message, {
-                agreedCompressor: this.description.compressor ?? 'none',
-                zlibCompressionLevel: this.description.zlibCompressionLevel,
-                timeoutContext: options.timeoutContext,
-                signal: options.signal
-            });
-            if (options.noResponse || message.moreToCome) {
-                yield responses_1.MongoDBResponse.empty;
-                return;
-            }
-            this.throwIfAborted();
-            if (options.timeoutContext?.csotEnabled() &&
-                options.timeoutContext.minRoundTripTime != null &&
-                options.timeoutContext.remainingTimeMS < options.timeoutContext.minRoundTripTime) {
-                throw new error_1.MongoOperationTimeoutError('Server roundtrip time is greater than the time remaining');
-            }
-            for await (const response of this.readMany(options)) {
-                this.socket.setTimeout(0);
-                const bson = response.parse();
-                const document = (responseType ?? responses_1.MongoDBResponse).make(bson);
-                yield document;
-                this.throwIfAborted();
-                this.socket.setTimeout(timeout);
-            }
-        }
-        finally {
-            this.socket.setTimeout(0);
-        }
+  }
+
+  this.emit('close', force);
+
+  for (const db of this.otherDbs) {
+    this._destroyCalled ? db.destroy({ force: force, skipCloseClient: true }) : db.close({ force: force, skipCloseClient: true });
+  }
+};
+
+/**
+ * Retrieves a raw collection instance, creating it if not cached.
+ * This method returns a thin wrapper around a [MongoDB Node.js driver collection]([MongoDB Node.js driver collection](https://mongodb.github.io/node-mongodb-native/Next/classes/Collection.html)).
+ * Using a Collection bypasses Mongoose middleware, validation, and casting,
+ * letting you use [MongoDB Node.js driver](https://mongodb.github.io/node-mongodb-native/) functionality directly.
+ *
+ * @param {String} name of the collection
+ * @param {Object} [options] optional collection options
+ * @return {Collection} collection instance
+ * @api public
+ */
+
+Connection.prototype.collection = function(name, options) {
+  const defaultOptions = {
+    autoIndex: this.config.autoIndex != null ? this.config.autoIndex : this.base.options.autoIndex,
+    autoCreate: this.config.autoCreate != null ? this.config.autoCreate : this.base.options.autoCreate,
+    autoSearchIndex: this.config.autoSearchIndex != null ? this.config.autoSearchIndex : this.base.options.autoSearchIndex
+  };
+  options = Object.assign({}, defaultOptions, options ? clone(options) : {});
+  options.$wasForceClosed = this.$wasForceClosed;
+  const Collection = this.base && this.base.__driver && this.base.__driver.Collection || driver.get().Collection;
+  if (!(name in this.collections)) {
+    this.collections[name] = new Collection(name, this, options);
+  }
+  return this.collections[name];
+};
+
+/**
+ * Declares a plugin executed on all schemas you pass to `conn.model()`
+ *
+ * Equivalent to calling `.plugin(fn)` on each schema you create.
+ *
+ * #### Example:
+ *
+ *     const db = mongoose.createConnection('mongodb://127.0.0.1:27017/mydb');
+ *     db.plugin(() => console.log('Applied'));
+ *     db.plugins.length; // 1
+ *
+ *     db.model('Test', new Schema({})); // Prints "Applied"
+ *
+ * @param {Function} fn plugin callback
+ * @param {Object} [opts] optional options
+ * @return {Connection} this
+ * @see plugins https://mongoosejs.com/docs/plugins.html
+ * @api public
+ */
+
+Connection.prototype.plugin = function(fn, opts) {
+  this.plugins.push([fn, opts]);
+  return this;
+};
+
+/**
+ * Defines or retrieves a model.
+ *
+ *     const mongoose = require('mongoose');
+ *     const db = mongoose.createConnection(..);
+ *     db.model('Venue', new Schema(..));
+ *     const Ticket = db.model('Ticket', new Schema(..));
+ *     const Venue = db.model('Venue');
+ *
+ * _When no `collection` argument is passed, Mongoose produces a collection name by passing the model `name` to the `utils.toCollectionName` method. This method pluralizes the name. If you don't like this behavior, either pass a collection name or set your schemas collection name option._
+ *
+ * #### Example:
+ *
+ *     const schema = new Schema({ name: String }, { collection: 'actor' });
+ *
+ *     // or
+ *
+ *     schema.set('collection', 'actor');
+ *
+ *     // or
+ *
+ *     const collectionName = 'actor'
+ *     const M = conn.model('Actor', schema, collectionName)
+ *
+ * @param {String|Function} name the model name or class extending Model
+ * @param {Schema} [schema] a schema. necessary when defining a model
+ * @param {String} [collection] name of mongodb collection (optional) if not given it will be induced from model name
+ * @param {Object} [options]
+ * @param {Boolean} [options.overwriteModels=false] If true, overwrite existing models with the same name to avoid `OverwriteModelError`
+ * @see Mongoose#model https://mongoosejs.com/docs/api/mongoose.html#Mongoose.prototype.model()
+ * @return {Model} The compiled model
+ * @api public
+ */
+
+Connection.prototype.model = function model(name, schema, collection, options) {
+  if (!(this instanceof Connection)) {
+    throw new MongooseError('`connection.model()` should not be run with ' +
+      '`new`. If you are doing `new db.model(foo)(bar)`, use ' +
+      '`db.model(foo)(bar)` instead');
+  }
+
+  let fn;
+  if (typeof name === 'function') {
+    fn = name;
+    name = fn.name;
+  }
+
+  // collection name discovery
+  if (typeof schema === 'string') {
+    collection = schema;
+    schema = false;
+  }
+
+  if (utils.isObject(schema)) {
+    if (!schema.instanceOfSchema) {
+      schema = new Schema(schema);
+    } else if (!(schema instanceof this.base.Schema)) {
+      schema = schema._clone(this.base.Schema);
     }
-    async *sendCommand(ns, command, options, responseType) {
-        options?.signal?.throwIfAborted();
-        const message = this.prepareCommand(ns.db, command, options);
-        let started = 0;
-        if (this.shouldEmitAndLogCommand) {
-            started = (0, utils_1.now)();
-            this.emitAndLogCommand(this.monitorCommands, Connection.COMMAND_STARTED, message.databaseName, this.established, new command_monitoring_events_1.CommandStartedEvent(this, message, this.description.serverConnectionId));
-        }
-        // If `documentsReturnedIn` not set or raw is not enabled, use input bson options
-        // Otherwise, support raw flag. Raw only works for cursors that hardcode firstBatch/nextBatch fields
-        const bsonOptions = options.documentsReturnedIn == null || !options.raw
-            ? options
-            : {
-                ...options,
-                raw: false,
-                fieldsAsRaw: { [options.documentsReturnedIn]: true }
-            };
-        /** MongoDBResponse instance or subclass */
-        let document = undefined;
-        /** Cached result of a toObject call */
-        let object = undefined;
-        try {
-            this.throwIfAborted();
-            for await (document of this.sendWire(message, options, responseType)) {
-                object = undefined;
-                if (options.session != null) {
-                    (0, sessions_1.updateSessionFromResponse)(options.session, document);
-                }
-                if (document.$clusterTime) {
-                    this.clusterTime = document.$clusterTime;
-                    this.emit(Connection.CLUSTER_TIME_RECEIVED, document.$clusterTime);
-                }
-                if (document.ok === 0) {
-                    if (options.timeoutContext?.csotEnabled() && document.isMaxTimeExpiredError) {
-                        throw new error_1.MongoOperationTimeoutError('Server reported a timeout error', {
-                            cause: new error_1.MongoServerError((object ??= document.toObject(bsonOptions)))
-                        });
-                    }
-                    throw new error_1.MongoServerError((object ??= document.toObject(bsonOptions)));
-                }
-                if (this.shouldEmitAndLogCommand) {
-                    this.emitAndLogCommand(this.monitorCommands, Connection.COMMAND_SUCCEEDED, message.databaseName, this.established, new command_monitoring_events_1.CommandSucceededEvent(this, message, options.noResponse
-                        ? undefined
-                        : message.moreToCome
-                            ? { ok: 1 }
-                            : (object ??= document.toObject(bsonOptions)), started, this.description.serverConnectionId));
-                }
-                if (responseType == null) {
-                    yield (object ??= document.toObject(bsonOptions));
-                }
-                else {
-                    yield document;
-                }
-                this.throwIfAborted();
-            }
-        }
-        catch (error) {
-            if (this.shouldEmitAndLogCommand) {
-                this.emitAndLogCommand(this.monitorCommands, Connection.COMMAND_FAILED, message.databaseName, this.established, new command_monitoring_events_1.CommandFailedEvent(this, message, error, started, this.description.serverConnectionId));
-            }
-            throw error;
-        }
+  }
+  if (schema && !schema.instanceOfSchema) {
+    throw new Error('The 2nd parameter to `mongoose.model()` should be a ' +
+      'schema or a POJO');
+  }
+
+  const defaultOptions = { cache: false, overwriteModels: this.base.options.overwriteModels };
+  const opts = Object.assign(defaultOptions, options, { connection: this });
+  if (this.models[name] && !collection && opts.overwriteModels !== true) {
+    // model exists but we are not subclassing with custom collection
+    if (schema && schema.instanceOfSchema && schema !== this.models[name].schema) {
+      throw new MongooseError.OverwriteModelError(name);
     }
-    async command(ns, command, options = {}, responseType) {
-        this.throwIfAborted();
-        options.signal?.throwIfAborted();
-        for await (const document of this.sendCommand(ns, command, options, responseType)) {
-            if (options.timeoutContext?.csotEnabled()) {
-                if (responses_1.MongoDBResponse.is(document)) {
-                    if (document.isMaxTimeExpiredError) {
-                        throw new error_1.MongoOperationTimeoutError('Server reported a timeout error', {
-                            cause: new error_1.MongoServerError(document.toObject())
-                        });
-                    }
-                }
-                else {
-                    if ((Array.isArray(document?.writeErrors) &&
-                        document.writeErrors.some(error => error?.code === error_1.MONGODB_ERROR_CODES.MaxTimeMSExpired)) ||
-                        document?.writeConcernError?.code === error_1.MONGODB_ERROR_CODES.MaxTimeMSExpired) {
-                        throw new error_1.MongoOperationTimeoutError('Server reported a timeout error', {
-                            cause: new error_1.MongoServerError(document)
-                        });
-                    }
-                }
-            }
-            return document;
-        }
-        throw new error_1.MongoUnexpectedServerResponseError('Unable to get response from server');
+    return this.models[name];
+  }
+
+  let model;
+
+  if (schema && schema.instanceOfSchema) {
+    applyPlugins(schema, this.plugins, null, '$connectionPluginsApplied');
+
+    // compile a model
+    model = this.base._model(fn || name, schema, collection, opts);
+
+    // only the first model with this name is cached to allow
+    // for one-offs with custom collection names etc.
+    if (!this.models[name]) {
+      this.models[name] = model;
     }
-    exhaustCommand(ns, command, options, replyListener) {
-        const exhaustLoop = async () => {
-            this.throwIfAborted();
-            for await (const reply of this.sendCommand(ns, command, options)) {
-                replyListener(undefined, reply);
-                this.throwIfAborted();
-            }
-            throw new error_1.MongoUnexpectedServerResponseError('Server ended moreToCome unexpectedly');
-        };
-        exhaustLoop().then(undefined, replyListener);
+
+    // Errors handled internally, so safe to ignore error
+    model.init().catch(function $modelInitNoop() {});
+
+    return model;
+  }
+
+  if (this.models[name] && collection) {
+    // subclassing current model with alternate collection
+    model = this.models[name];
+    schema = model.prototype.schema;
+    const sub = model.__subclass(this, schema, collection);
+    // do not cache the sub model
+    return sub;
+  }
+
+  if (arguments.length === 1) {
+    model = this.models[name];
+    if (!model) {
+      throw new MongooseError.MissingSchemaError(name);
     }
-    throwIfAborted() {
-        if (this.error)
-            throw this.error;
+    return model;
+  }
+
+  if (!model) {
+    throw new MongooseError.MissingSchemaError(name);
+  }
+
+  if (this === model.prototype.db
+      && (!collection || collection === model.collection.name)) {
+    // model already uses this connection.
+
+    // only the first model with this name is cached to allow
+    // for one-offs with custom collection names etc.
+    if (!this.models[name]) {
+      this.models[name] = model;
     }
-    /**
-     * @internal
-     *
-     * Writes an OP_MSG or OP_QUERY request to the socket, optionally compressing the command. This method
-     * waits until the socket's buffer has emptied (the Nodejs socket `drain` event has fired).
-     */
-    async writeCommand(command, options) {
-        const finalCommand = options.agreedCompressor === 'none' || !commands_1.OpCompressedRequest.canCompress(command)
-            ? command
-            : new commands_1.OpCompressedRequest(command, {
-                agreedCompressor: options.agreedCompressor ?? 'none',
-                zlibCompressionLevel: options.zlibCompressionLevel ?? 0
-            });
-        const buffer = Buffer.concat(await finalCommand.toBin());
-        if (options.timeoutContext?.csotEnabled()) {
-            if (options.timeoutContext.minRoundTripTime != null &&
-                options.timeoutContext.remainingTimeMS < options.timeoutContext.minRoundTripTime) {
-                throw new error_1.MongoOperationTimeoutError('Server roundtrip time is greater than the time remaining');
-            }
-        }
-        if (this.socket.write(buffer))
-            return;
-        const drainEvent = (0, utils_1.once)(this.socket, 'drain', options);
-        const timeout = options?.timeoutContext?.timeoutForSocketWrite;
-        const drained = timeout ? Promise.race([drainEvent, timeout]) : drainEvent;
-        try {
-            return await drained;
-        }
-        catch (writeError) {
-            if (timeout_1.TimeoutError.is(writeError)) {
-                const timeoutError = new error_1.MongoOperationTimeoutError('Timed out at socket write');
-                this.onError(timeoutError);
-                throw timeoutError;
-            }
-            else if (writeError === options.signal?.reason) {
-                this.onError(writeError);
-            }
-            throw writeError;
-        }
-        finally {
-            timeout?.clear();
-        }
+
+    return model;
+  }
+  this.models[name] = model.__subclass(this, schema, collection);
+  return this.models[name];
+};
+
+/**
+ * Removes the model named `name` from this connection, if it exists. You can
+ * use this function to clean up any models you created in your tests to
+ * prevent OverwriteModelErrors.
+ *
+ * #### Example:
+ *
+ *     conn.model('User', new Schema({ name: String }));
+ *     console.log(conn.model('User')); // Model object
+ *     conn.deleteModel('User');
+ *     console.log(conn.model('User')); // undefined
+ *
+ *     // Usually useful in a Mocha `afterEach()` hook
+ *     afterEach(function() {
+ *       conn.deleteModel(/.+/); // Delete every model
+ *     });
+ *
+ * @api public
+ * @param {String|RegExp} name if string, the name of the model to remove. If regexp, removes all models whose name matches the regexp.
+ * @return {Connection} this
+ */
+
+Connection.prototype.deleteModel = function deleteModel(name) {
+  if (typeof name === 'string') {
+    const model = this.model(name);
+    if (model == null) {
+      return this;
     }
-    /**
-     * @internal
-     *
-     * Returns an async generator that yields full wire protocol messages from the underlying socket.  This function
-     * yields messages until `moreToCome` is false or not present in a response, or the caller cancels the request
-     * by calling `return` on the generator.
-     *
-     * Note that `for-await` loops call `return` automatically when the loop is exited.
-     */
-    async *readMany(options) {
-        try {
-            this.dataEvents = (0, on_data_1.onData)(this.messageStream, options);
-            this.messageStream.resume();
-            for await (const message of this.dataEvents) {
-                const response = await (0, compression_1.decompressResponse)(message);
-                yield response;
-                if (!response.moreToCome) {
-                    return;
-                }
-            }
-        }
-        catch (readError) {
-            if (timeout_1.TimeoutError.is(readError)) {
-                const timeoutError = new error_1.MongoOperationTimeoutError(`Timed out during socket read (${readError.duration}ms)`);
-                this.dataEvents = null;
-                this.onError(timeoutError);
-                throw timeoutError;
-            }
-            else if (readError === options.signal?.reason) {
-                this.onError(readError);
-            }
-            throw readError;
-        }
-        finally {
-            this.dataEvents = null;
-            this.messageStream.pause();
-        }
+    const collectionName = model.collection.name;
+    delete this.models[name];
+    delete this.collections[collectionName];
+
+    this.emit('deleteModel', model);
+  } else if (name instanceof RegExp) {
+    const pattern = name;
+    const names = this.modelNames();
+    for (const name of names) {
+      if (pattern.test(name)) {
+        this.deleteModel(name);
+      }
     }
-}
-exports.Connection = Connection;
-/** @event */
-Connection.COMMAND_STARTED = constants_1.COMMAND_STARTED;
-/** @event */
-Connection.COMMAND_SUCCEEDED = constants_1.COMMAND_SUCCEEDED;
-/** @event */
-Connection.COMMAND_FAILED = constants_1.COMMAND_FAILED;
-/** @event */
-Connection.CLUSTER_TIME_RECEIVED = constants_1.CLUSTER_TIME_RECEIVED;
-/** @event */
-Connection.CLOSE = constants_1.CLOSE;
-/** @event */
-Connection.PINNED = constants_1.PINNED;
-/** @event */
-Connection.UNPINNED = constants_1.UNPINNED;
-/** @internal */
-class SizedMessageTransform extends stream_1.Transform {
-    constructor({ connection }) {
-        super({ writableObjectMode: false, readableObjectMode: true });
-        this.bufferPool = new utils_1.BufferPool();
-        this.connection = connection;
+  } else {
+    throw new Error('First parameter to `deleteModel()` must be a string ' +
+      'or regexp, got "' + name + '"');
+  }
+
+  return this;
+};
+
+/**
+ * Watches the entire underlying database for changes. Similar to
+ * [`Model.watch()`](https://mongoosejs.com/docs/api/model.html#Model.watch()).
+ *
+ * This function does **not** trigger any middleware. In particular, it
+ * does **not** trigger aggregate middleware.
+ *
+ * The ChangeStream object is an event emitter that emits the following events:
+ *
+ * - 'change': A change occurred, see below example
+ * - 'error': An unrecoverable error occurred. In particular, change streams currently error out if they lose connection to the replica set primary. Follow [this GitHub issue](https://github.com/Automattic/mongoose/issues/6799) for updates.
+ * - 'end': Emitted if the underlying stream is closed
+ * - 'close': Emitted if the underlying stream is closed
+ *
+ * #### Example:
+ *
+ *     const User = conn.model('User', new Schema({ name: String }));
+ *
+ *     const changeStream = conn.watch().on('change', data => console.log(data));
+ *
+ *     // Triggers a 'change' event on the change stream.
+ *     await User.create({ name: 'test' });
+ *
+ * @api public
+ * @param {Array} [pipeline]
+ * @param {Object} [options] passed without changes to [the MongoDB driver's `Db#watch()` function](https://mongodb.github.io/node-mongodb-native/4.9/classes/Db.html#watch)
+ * @return {ChangeStream} mongoose-specific change stream wrapper, inherits from EventEmitter
+ */
+
+Connection.prototype.watch = function watch(pipeline, options) {
+  const changeStreamThunk = cb => {
+    immediate(() => {
+      if (this.readyState === STATES.connecting) {
+        this.once('open', function() {
+          const driverChangeStream = this.db.watch(pipeline, options);
+          cb(null, driverChangeStream);
+        });
+      } else {
+        const driverChangeStream = this.db.watch(pipeline, options);
+        cb(null, driverChangeStream);
+      }
+    });
+  };
+
+  const changeStream = new ChangeStream(changeStreamThunk, pipeline, options);
+  return changeStream;
+};
+
+/**
+ * Returns a promise that resolves when this connection
+ * successfully connects to MongoDB, or rejects if this connection failed
+ * to connect.
+ *
+ * #### Example:
+ *
+ *     const conn = await mongoose.createConnection('mongodb://127.0.0.1:27017/test').
+ *       asPromise();
+ *     conn.readyState; // 1, means Mongoose is connected
+ *
+ * @api public
+ * @return {Promise}
+ */
+
+Connection.prototype.asPromise = async function asPromise() {
+  try {
+    await this.$initialConnection;
+    return this;
+  } catch (err) {
+    throw _handleConnectionErrors(err);
+  }
+};
+
+/**
+ * Returns an array of model names created on this connection.
+ * @api public
+ * @return {String[]}
+ */
+
+Connection.prototype.modelNames = function modelNames() {
+  return Object.keys(this.models);
+};
+
+/**
+ * Returns if the connection requires authentication after it is opened. Generally if a
+ * username and password are both provided than authentication is needed, but in some cases a
+ * password is not required.
+ *
+ * @api private
+ * @return {Boolean} true if the connection should be authenticated after it is opened, otherwise false.
+ */
+Connection.prototype.shouldAuthenticate = function shouldAuthenticate() {
+  return this.user != null &&
+    (this.pass != null || this.authMechanismDoesNotRequirePassword());
+};
+
+/**
+ * Returns a boolean value that specifies if the current authentication mechanism needs a
+ * password to authenticate according to the auth objects passed into the openUri methods.
+ *
+ * @api private
+ * @return {Boolean} true if the authentication mechanism specified in the options object requires
+ *  a password, otherwise false.
+ */
+Connection.prototype.authMechanismDoesNotRequirePassword = function authMechanismDoesNotRequirePassword() {
+  if (this.options && this.options.auth) {
+    return noPasswordAuthMechanisms.indexOf(this.options.auth.authMechanism) >= 0;
+  }
+  return true;
+};
+
+/**
+ * Returns a boolean value that specifies if the provided objects object provides enough
+ * data to authenticate with. Generally this is true if the username and password are both specified
+ * but in some authentication methods, a password is not required for authentication so only a username
+ * is required.
+ *
+ * @param {Object} [options] the options object passed into the openUri methods.
+ * @api private
+ * @return {Boolean} true if the provided options object provides enough data to authenticate with,
+ *   otherwise false.
+ */
+Connection.prototype.optionsProvideAuthenticationData = function optionsProvideAuthenticationData(options) {
+  return (options) &&
+      (options.user) &&
+      ((options.pass) || this.authMechanismDoesNotRequirePassword());
+};
+
+/**
+ * Returns the [MongoDB driver `MongoClient`](https://mongodb.github.io/node-mongodb-native/4.9/classes/MongoClient.html) instance
+ * that this connection uses to talk to MongoDB.
+ *
+ * #### Example:
+ *
+ *     const conn = await mongoose.createConnection('mongodb://127.0.0.1:27017/test').
+ *       asPromise();
+ *
+ *     conn.getClient(); // MongoClient { ... }
+ *
+ * @api public
+ * @return {MongoClient}
+ */
+
+Connection.prototype.getClient = function getClient() {
+  return this.client;
+};
+
+/**
+ * Set the [MongoDB driver `MongoClient`](https://mongodb.github.io/node-mongodb-native/4.9/classes/MongoClient.html) instance
+ * that this connection uses to talk to MongoDB. This is useful if you already have a MongoClient instance, and want to
+ * reuse it.
+ *
+ * #### Example:
+ *
+ *     const client = await mongodb.MongoClient.connect('mongodb://127.0.0.1:27017/test');
+ *
+ *     const conn = mongoose.createConnection().setClient(client);
+ *
+ *     conn.getClient(); // MongoClient { ... }
+ *     conn.readyState; // 1, means 'CONNECTED'
+ *
+ * @api public
+ * @param {MongClient} client The Client to set to be used.
+ * @return {Connection} this
+ */
+
+Connection.prototype.setClient = function setClient() {
+  throw new MongooseError('Connection#setClient not implemented by driver');
+};
+
+/*!
+ * Called internally by `openUri()` to create a MongoClient instance.
+ */
+
+Connection.prototype.createClient = function createClient() {
+  throw new MongooseError('Connection#createClient not implemented by driver');
+};
+
+/**
+ * Syncs all the indexes for the models registered with this connection.
+ *
+ * @param {Object} [options]
+ * @param {Boolean} [options.continueOnError] `false` by default. If set to `true`, mongoose will not throw an error if one model syncing failed, and will return an object where the keys are the names of the models, and the values are the results/errors for each model.
+ * @return {Promise<Object>} Returns a Promise, when the Promise resolves the value is a list of the dropped indexes.
+ */
+Connection.prototype.syncIndexes = async function syncIndexes(options = {}) {
+  const result = {};
+  const errorsMap = { };
+
+  const { continueOnError } = options;
+  delete options.continueOnError;
+
+  for (const model of Object.values(this.models)) {
+    try {
+      result[model.modelName] = await model.syncIndexes(options);
+    } catch (err) {
+      if (!continueOnError) {
+        errorsMap[model.modelName] = err;
+        break;
+      } else {
+        result[model.modelName] = err;
+      }
     }
-    _transform(chunk, encoding, callback) {
-        if (this.connection.delayedTimeoutId != null) {
-            (0, timers_1.clearTimeout)(this.connection.delayedTimeoutId);
-            this.connection.delayedTimeoutId = null;
-        }
-        this.bufferPool.append(chunk);
-        while (this.bufferPool.length) {
-            // While there are any bytes in the buffer
-            // Try to fetch a size from the top 4 bytes
-            const sizeOfMessage = this.bufferPool.getInt32();
-            if (sizeOfMessage == null) {
-                // Not even an int32 worth of data. Stop the loop, we need more chunks.
-                break;
-            }
-            if (sizeOfMessage < 0) {
-                // The size in the message has a negative value, this is probably corruption, throw:
-                return callback(new error_1.MongoParseError(`Message size cannot be negative: ${sizeOfMessage}`));
-            }
-            if (sizeOfMessage > this.bufferPool.length) {
-                // We do not have enough bytes to make a sizeOfMessage chunk
-                break;
-            }
-            // Add a message to the stream
-            const message = this.bufferPool.read(sizeOfMessage);
-            if (!this.push(message)) {
-                // We only subscribe to data events so we should never get backpressure
-                // if we do, we do not have the handling for it.
-                return callback(new error_1.MongoRuntimeError(`SizedMessageTransform does not support backpressure`));
-            }
-        }
-        callback();
-    }
-}
-exports.SizedMessageTransform = SizedMessageTransform;
-/** @internal */
-class CryptoConnection extends Connection {
-    constructor(stream, options) {
-        super(stream, options);
-        this.autoEncrypter = options.autoEncrypter;
-    }
-    async command(ns, cmd, options, responseType) {
-        const { autoEncrypter } = this;
-        if (!autoEncrypter) {
-            // TODO(NODE-6065): throw a MongoRuntimeError in Node V7
-            // @ts-expect-error No cause provided because there is no underlying error.
-            throw new error_1.MongoMissingDependencyError('No AutoEncrypter available for encryption', {
-                dependencyName: 'n/a'
-            });
-        }
-        const serverWireVersion = (0, utils_1.maxWireVersion)(this);
-        if (serverWireVersion === 0) {
-            // This means the initial handshake hasn't happened yet
-            return await super.command(ns, cmd, options, responseType);
-        }
-        if (serverWireVersion < 8) {
-            throw new error_1.MongoCompatibilityError('Auto-encryption requires a minimum MongoDB version of 4.2');
-        }
-        // Save sort or indexKeys based on the command being run
-        // the encrypt API serializes our JS objects to BSON to pass to the native code layer
-        // and then deserializes the encrypted result, the protocol level components
-        // of the command (ex. sort) are then converted to JS objects potentially losing
-        // import key order information. These fields are never encrypted so we can save the values
-        // from before the encryption and replace them after encryption has been performed
-        const sort = cmd.find || cmd.findAndModify ? cmd.sort : null;
-        const indexKeys = cmd.createIndexes
-            ? cmd.indexes.map((index) => index.key)
-            : null;
-        const encrypted = await autoEncrypter.encrypt(ns.toString(), cmd, options);
-        // Replace the saved values
-        if (sort != null && (cmd.find || cmd.findAndModify)) {
-            encrypted.sort = sort;
-        }
-        if (indexKeys != null && cmd.createIndexes) {
-            for (const [offset, index] of indexKeys.entries()) {
-                // @ts-expect-error `encrypted` is a generic "command", but we've narrowed for only `createIndexes` commands here
-                encrypted.indexes[offset].key = index;
-            }
-        }
-        const encryptedResponse = await super.command(ns, encrypted, options, 
-        // Eventually we want to require `responseType` which means we would satisfy `T` as the return type.
-        // In the meantime, we want encryptedResponse to always be _at least_ a MongoDBResponse if not a more specific subclass
-        // So that we can ensure we have access to the on-demand APIs for decorate response
-        responseType ?? responses_1.MongoDBResponse);
-        const result = await autoEncrypter.decrypt(encryptedResponse.toBytes(), options);
-        const decryptedResponse = responseType?.make(result) ?? (0, bson_1.deserialize)(result, options);
-        if (autoEncrypter[constants_1.kDecorateResult]) {
-            if (responseType == null) {
-                (0, utils_1.decorateDecryptionResult)(decryptedResponse, encryptedResponse.toObject(), true);
-            }
-            else if (decryptedResponse instanceof responses_1.CursorResponse) {
-                decryptedResponse.encryptedResponse = encryptedResponse;
-            }
-        }
-        return decryptedResponse;
-    }
-}
-exports.CryptoConnection = CryptoConnection;
-//# sourceMappingURL=connection.js.map
+  }
+
+  if (!continueOnError && Object.keys(errorsMap).length) {
+    const message = Object.entries(errorsMap).map(([modelName, err]) => `${modelName}: ${err.message}`).join(', ');
+    const syncIndexesError = new SyncIndexesError(message, errorsMap);
+    throw syncIndexesError;
+  }
+
+  return result;
+};
+
+/**
+ * Switches to a different database using the same [connection pool](https://mongoosejs.com/docs/api/connectionshtml#connection_pools).
+ *
+ * Returns a new connection object, with the new db.
+ *
+ * #### Example:
+ *
+ *     // Connect to `initialdb` first
+ *     const conn = await mongoose.createConnection('mongodb://127.0.0.1:27017/initialdb').asPromise();
+ *
+ *     // Creates an un-cached connection to `mydb`
+ *     const db = conn.useDb('mydb');
+ *     // Creates a cached connection to `mydb2`. All calls to `conn.useDb('mydb2', { useCache: true })` will return the same
+ *     // connection instance as opposed to creating a new connection instance
+ *     const db2 = conn.useDb('mydb2', { useCache: true });
+ *
+ * @method useDb
+ * @memberOf Connection
+ * @param {String} name The database name
+ * @param {Object} [options]
+ * @param {Boolean} [options.useCache=false] If true, cache results so calling `useDb()` multiple times with the same name only creates 1 connection object.
+ * @param {Boolean} [options.noListener=false] If true, the connection object will not make the db listen to events on the original connection. See [issue #9961](https://github.com/Automattic/mongoose/issues/9961).
+ * @return {Connection} New Connection Object
+ * @api public
+ */
+
+/**
+ * Runs a [db-level aggregate()](https://www.mongodb.com/docs/manual/reference/method/db.aggregate/) on this connection's underlying `db`
+ *
+ * @method aggregate
+ * @memberOf Connection
+ * @param {Array} pipeline
+ * @param {Object} [options]
+ * @param {Boolean} [options.cursor=false] If true, make the Aggregate resolve to a Mongoose AggregationCursor rather than an array
+ * @return {Aggregate} Aggregation wrapper
+ * @api public
+ */
+
+/**
+ * Removes the database connection with the given name created with with `useDb()`.
+ *
+ * Throws an error if the database connection was not found.
+ *
+ * #### Example:
+ *
+ *     // Connect to `initialdb` first
+ *     const conn = await mongoose.createConnection('mongodb://127.0.0.1:27017/initialdb').asPromise();
+ *
+ *     // Creates an un-cached connection to `mydb`
+ *     const db = conn.useDb('mydb');
+ *
+ *     // Closes `db`, and removes `db` from `conn.relatedDbs` and `conn.otherDbs`
+ *     await conn.removeDb('mydb');
+ *
+ * @method removeDb
+ * @memberOf Connection
+ * @param {String} name The database name
+ * @return {Connection} this
+ * @api public
+ */
+
+/*!
+ * Module exports.
+ */
+
+Connection.STATES = STATES;
+module.exports = Connection;

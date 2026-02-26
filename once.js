@@ -1,17 +1,12 @@
-"use strict";
+'use strict';
 
-Object.defineProperty(exports, "__esModule", {
-    value: true
-});
-exports.default = once;
-function once(fn) {
-    function wrapper(...args) {
-        if (fn === null) return;
-        var callFn = fn;
-        fn = null;
-        callFn.apply(this, args);
+module.exports = function once(fn) {
+  let called = false;
+  return function() {
+    if (called) {
+      return;
     }
-    Object.assign(wrapper, fn);
-    return wrapper;
-}
-module.exports = exports.default;
+    called = true;
+    return fn.apply(null, arguments);
+  };
+};

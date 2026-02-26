@@ -1,6 +1,16 @@
 'use strict';
 
-/** @type {import('./isObject')} */
-module.exports = function isObject(x) {
-	return !!x && (typeof x === 'function' || typeof x === 'object');
+/**
+ * Determines if `arg` is an object.
+ *
+ * @param {Object|Array|String|Function|RegExp|any} arg
+ * @api private
+ * @return {Boolean}
+ */
+
+module.exports = function(arg) {
+  return (
+    Buffer.isBuffer(arg) ||
+    Object.prototype.toString.call(arg) === '[object Object]'
+  );
 };
