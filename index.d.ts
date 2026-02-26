@@ -1,179 +1,169 @@
-/**
- * An events map is an interface that maps event names to their value, which
- * represents the type of the `on` listener.
- */
-export interface EventsMap {
-    [event: string]: any;
+/// <reference lib="es2020"/>
+/** https://url.spec.whatwg.org/#url-representation */
+export interface URLRecord {
+    scheme: string;
+    username: string;
+    password: string;
+    host: string | number | IPv6Address | null;
+    port: number | null;
+    path: string | string[];
+    query: string | null;
+    fragment: string | null;
 }
 
-/**
- * The default events map, used if no EventsMap is given. Using this EventsMap
- * is equivalent to accepting all event names, and any data.
- */
-export interface DefaultEventsMap {
-    [event: string]: (...args: any[]) => void;
+/** https://url.spec.whatwg.org/#concept-ipv6 */
+export type IPv6Address = [number, number, number, number, number, number, number, number];
+
+/** https://url.spec.whatwg.org/#url-class */
+export class URL {
+    constructor(url: string, base?: string | URL);
+
+    get href(): string;
+    set href(V: string);
+
+    get origin(): string;
+
+    get protocol(): string;
+    set protocol(V: string);
+
+    get username(): string;
+    set username(V: string);
+
+    get password(): string;
+    set password(V: string);
+
+    get host(): string;
+    set host(V: string);
+
+    get hostname(): string;
+    set hostname(V: string);
+
+    get port(): string;
+    set port(V: string);
+
+    get pathname(): string;
+    set pathname(V: string);
+
+    get search(): string;
+    set search(V: string);
+
+    get searchParams(): URLSearchParams;
+
+    get hash(): string;
+    set hash(V: string);
+
+    toJSON(): string;
+
+    readonly [Symbol.toStringTag]: "URL";
 }
 
-/**
- * Returns a union type containing all the keys of an event map.
- */
-export type EventNames<Map extends EventsMap> = keyof Map & (string | symbol);
+/** https://url.spec.whatwg.org/#interface-urlsearchparams */
+export class URLSearchParams {
+    constructor(
+        init?:
+            | ReadonlyArray<readonly [name: string, value: string]>
+            | Iterable<readonly [name: string, value: string]>
+            | { readonly [name: string]: string }
+            | string,
+    );
 
-/** The tuple type representing the parameters of an event listener */
-export type EventParams<
-    Map extends EventsMap,
-    Ev extends EventNames<Map>
-    > = Parameters<Map[Ev]>;
+    append(name: string, value: string): void;
+    delete(name: string): void;
+    get(name: string): string | null;
+    getAll(name: string): string[];
+    has(name: string): boolean;
+    set(name: string, value: string): void;
+    sort(): void;
 
-/**
- * The event names that are either in ReservedEvents or in UserEvents
- */
-export type ReservedOrUserEventNames<
-    ReservedEventsMap extends EventsMap,
-    UserEvents extends EventsMap
-    > = EventNames<ReservedEventsMap> | EventNames<UserEvents>;
+    keys(): IterableIterator<string>;
+    values(): IterableIterator<string>;
+    entries(): IterableIterator<[name: string, value: string]>;
+    forEach<THIS_ARG = void>(
+        callback: (this: THIS_ARG, value: string, name: string, searchParams: this) => void,
+        thisArg?: THIS_ARG,
+    ): void;
 
-/**
- * Type of a listener of a user event or a reserved event. If `Ev` is in
- * `ReservedEvents`, the reserved event listener is returned.
- */
-export type ReservedOrUserListener<
-    ReservedEvents extends EventsMap,
-    UserEvents extends EventsMap,
-    Ev extends ReservedOrUserEventNames<ReservedEvents, UserEvents>
-    > = FallbackToUntypedListener<
-    Ev extends EventNames<ReservedEvents>
-        ? ReservedEvents[Ev]
-        : Ev extends EventNames<UserEvents>
-        ? UserEvents[Ev]
-        : never
-    >;
-
-/**
- * Returns an untyped listener type if `T` is `never`; otherwise, returns `T`.
- *
- * This is a hack to mitigate https://github.com/socketio/socket.io/issues/3833.
- * Needed because of https://github.com/microsoft/TypeScript/issues/41778
- */
-type FallbackToUntypedListener<T> = [T] extends [never]
-    ? (...args: any[]) => void | Promise<void>
-    : T;
-
-/**
- * Strictly typed version of an `EventEmitter`. A `TypedEventEmitter` takes type
- * parameters for mappings of event names to event data types, and strictly
- * types method calls to the `EventEmitter` according to these event maps.
- *
- * @typeParam ListenEvents - `EventsMap` of user-defined events that can be
- * listened to with `on` or `once`
- * @typeParam EmitEvents - `EventsMap` of user-defined events that can be
- * emitted with `emit`
- * @typeParam ReservedEvents - `EventsMap` of reserved events, that can be
- * emitted by socket.io with `emitReserved`, and can be listened to with
- * `listen`.
- */
-export class Emitter<
-    ListenEvents extends EventsMap,
-    EmitEvents extends EventsMap,
-    ReservedEvents extends EventsMap = {}
-    > {
-    /**
-     * Adds the `listener` function as an event listener for `ev`.
-     *
-     * @param ev Name of the event
-     * @param listener Callback function
-     */
-    on<Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>>(
-        ev: Ev,
-        listener: ReservedOrUserListener<ReservedEvents, ListenEvents, Ev>
-    ): this;
-
-    /**
-     * Adds a one-time `listener` function as an event listener for `ev`.
-     *
-     * @param ev Name of the event
-     * @param listener Callback function
-     */
-    once<Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>>(
-        ev: Ev,
-        listener: ReservedOrUserListener<ReservedEvents, ListenEvents, Ev>
-    ): this;
-
-    /**
-     * Removes the `listener` function as an event listener for `ev`.
-     *
-     * @param ev Name of the event
-     * @param listener Callback function
-     */
-    off<Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>>(
-        ev?: Ev,
-        listener?: ReservedOrUserListener<ReservedEvents, ListenEvents, Ev>
-    ): this;
-
-    /**
-     * Emits an event.
-     *
-     * @param ev Name of the event
-     * @param args Values to send to listeners of this event
-     */
-    emit<Ev extends EventNames<EmitEvents>>(
-        ev: Ev,
-        ...args: EventParams<EmitEvents, Ev>
-    ): this;
-
-    /**
-     * Emits a reserved event.
-     *
-     * This method is `protected`, so that only a class extending
-     * `StrictEventEmitter` can emit its own reserved events.
-     *
-     * @param ev Reserved event name
-     * @param args Arguments to emit along with the event
-     */
-    protected emitReserved<Ev extends EventNames<ReservedEvents>>(
-        ev: Ev,
-        ...args: EventParams<ReservedEvents, Ev>
-    ): this;
-
-    /**
-     * Returns the listeners listening to an event.
-     *
-     * @param event Event name
-     * @returns Array of listeners subscribed to `event`
-     */
-    listeners<Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>>(
-        event: Ev
-    ): ReservedOrUserListener<ReservedEvents, ListenEvents, Ev>[];
-
-    /**
-     * Returns true if there is a listener for this event.
-     *
-     * @param event Event name
-     * @returns boolean
-     */
-    hasListeners<
-        Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>
-        >(event: Ev): boolean;
-
-    /**
-     * Removes the `listener` function as an event listener for `ev`.
-     *
-     * @param ev Name of the event
-     * @param listener Callback function
-     */
-    removeListener<
-        Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>
-        >(
-        ev?: Ev,
-        listener?: ReservedOrUserListener<ReservedEvents, ListenEvents, Ev>
-    ): this;
-
-    /**
-     * Removes all `listener` function as an event listener for `ev`.
-     *
-     * @param ev Name of the event
-     */
-    removeAllListeners<
-        Ev extends ReservedOrUserEventNames<ReservedEvents, ListenEvents>
-        >(ev?: Ev): this;
+    readonly [Symbol.toStringTag]: "URLSearchParams";
+    [Symbol.iterator](): IterableIterator<[name: string, value: string]>;
 }
+
+/** https://url.spec.whatwg.org/#concept-url-parser */
+export function parseURL(input: string, options?: { readonly baseURL?: URLRecord | undefined }): URLRecord | null;
+
+/** https://url.spec.whatwg.org/#concept-basic-url-parser */
+export function basicURLParse(
+    input: string,
+    options?: {
+        baseURL?: URLRecord | undefined;
+        url?: URLRecord | undefined;
+        stateOverride?: StateOverride | undefined;
+    },
+): URLRecord | null;
+
+/** https://url.spec.whatwg.org/#scheme-start-state */
+export type StateOverride =
+    | "scheme start"
+    | "scheme"
+    | "no scheme"
+    | "special relative or authority"
+    | "path or authority"
+    | "relative"
+    | "relative slash"
+    | "special authority slashes"
+    | "special authority ignore slashes"
+    | "authority"
+    | "host"
+    | "hostname"
+    | "port"
+    | "file"
+    | "file slash"
+    | "file host"
+    | "path start"
+    | "path"
+    | "opaque path"
+    | "query"
+    | "fragment";
+
+/** https://url.spec.whatwg.org/#concept-url-serializer */
+export function serializeURL(urlRecord: URLRecord, excludeFragment?: boolean): string;
+
+/** https://url.spec.whatwg.org/#concept-host-serializer */
+export function serializeHost(host: string | number | IPv6Address): string;
+
+/** https://url.spec.whatwg.org/#url-path-serializer */
+export function serializePath(urlRecord: URLRecord): string;
+
+/** https://url.spec.whatwg.org/#serialize-an-integer */
+export function serializeInteger(number: number): string;
+
+/** https://html.spec.whatwg.org#ascii-serialisation-of-an-origin */
+export function serializeURLOrigin(urlRecord: URLRecord): string;
+
+/** https://url.spec.whatwg.org/#set-the-username */
+export function setTheUsername(urlRecord: URLRecord, username: string): void;
+
+/** https://url.spec.whatwg.org/#set-the-password */
+export function setThePassword(urlRecord: URLRecord, password: string): void;
+
+/** https://url.spec.whatwg.org/#url-opaque-path */
+export function hasAnOpaquePath(urlRecord: URLRecord): boolean;
+
+/** https://url.spec.whatwg.org/#cannot-have-a-username-password-port */
+export function cannotHaveAUsernamePasswordPort(urlRecord: URLRecord): boolean;
+
+/** https://url.spec.whatwg.org/#percent-decode */
+export function percentDecodeBytes(buffer: TypedArray): Uint8Array;
+
+/** https://url.spec.whatwg.org/#string-percent-decode */
+export function percentDecodeString(string: string): Uint8Array;
+
+export type TypedArray =
+    | Uint8Array
+    | Uint8ClampedArray
+    | Uint16Array
+    | Uint32Array
+    | Int8Array
+    | Int16Array
+    | Int32Array
+    | Float32Array
+    | Float64Array;
