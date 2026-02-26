@@ -1,42 +1,80 @@
-/*jshint node:true */
-'use strict';
+var tape = require('tape')
+var pager = require('./')
 
-var bufferEq = require('./index');
-var assert = require('assert');
+tape('get page', function (t) {
+  var pages = pager(1024)
 
-describe('buffer-equal-constant-time', function() {
-  var a = new Buffer('asdfasdf123456');
-  var b = new Buffer('asdfasdf123456');
-  var c = new Buffer('asdfasdf');
+  var page = pages.get(0)
 
-  describe('bufferEq', function() {
-    it('says a == b', function() {
-      assert.strictEqual(bufferEq(a, b), true);
-    });
+  t.same(page.offset, 0)
+  t.same(page.buffer, Buffer.alloc(1024))
+  t.end()
+})
 
-    it('says a != c', function() {
-      assert.strictEqual(bufferEq(a, c), false);
-    });
-  });
+tape('get page twice', function (t) {
+  var pages = pager(1024)
+  t.same(pages.length, 0)
 
-  describe('install/restore', function() {
-    before(function() {
-      bufferEq.install();
-    });
-    after(function() {
-      bufferEq.restore();
-    });
+  var page = pages.get(0)
 
-    it('installed an .equal method', function() {
-      var SlowBuffer = require('buffer').SlowBuffer;
-      assert.ok(Buffer.prototype.equal);
-      assert.ok(SlowBuffer.prototype.equal);
-    });
+  t.same(page.offset, 0)
+  t.same(page.buffer, Buffer.alloc(1024))
+  t.same(pages.length, 1)
 
-    it('infected existing Buffers', function() {
-      assert.strictEqual(a.equal(b), true);
-      assert.strictEqual(a.equal(c), false);
-    });
-  });
+  var other = pages.get(0)
 
-});
+  t.same(other, page)
+  t.end()
+})
+
+tape('get no mutable page', function (t) {
+  var pages = pager(1024)
+
+  t.ok(!pages.get(141, true))
+  t.ok(pages.get(141))
+  t.ok(pages.get(141, true))
+
+  t.end()
+})
+
+tape('get far out page', function (t) {
+  var pages = pager(1024)
+
+  var page = pages.get(1000000)
+
+  t.same(page.offset, 1000000 * 1024)
+  t.same(page.buffer, Buffer.alloc(1024))
+  t.same(pages.length, 1000000 + 1)
+
+  var other = pages.get(1)
+
+  t.same(other.offset, 1024)
+  t.same(other.buffer, Buffer.alloc(1024))
+  t.same(pages.length, 1000000 + 1)
+  t.ok(other !== page)
+
+  t.end()
+})
+
+tape('updates', function (t) {
+  var pages = pager(1024)
+
+  t.same(pages.lastUpdate(), null)
+
+  var page = pages.get(10)
+
+  page.buffer[42] = 1
+  pages.updated(page)
+
+  t.same(pages.lastUpdate(), page)
+  t.same(pages.lastUpdate(), null)
+
+  page.buffer[42] = 2
+  pages.updated(page)
+  pages.updated(page)
+
+  t.same(pages.lastUpdate(), page)
+  t.same(pages.lastUpdate(), null)
+
+  t.end()
+})
