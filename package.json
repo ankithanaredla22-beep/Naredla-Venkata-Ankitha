@@ -1,37 +1,56 @@
 {
-    "name": "@types/whatwg-url",
-    "version": "11.0.5",
-    "description": "TypeScript definitions for whatwg-url",
-    "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/whatwg-url",
-    "license": "MIT",
-    "contributors": [
-        {
-            "name": "Alexander Marks",
-            "githubUsername": "aomarks",
-            "url": "https://github.com/aomarks"
-        },
-        {
-            "name": "ExE Boss",
-            "githubUsername": "ExE-Boss",
-            "url": "https://github.com/ExE-Boss"
-        },
-        {
-            "name": "BendingBender",
-            "githubUsername": "BendingBender",
-            "url": "https://github.com/BendingBender"
-        }
-    ],
-    "main": "",
-    "types": "index.d.ts",
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/DefinitelyTyped/DefinitelyTyped.git",
-        "directory": "types/whatwg-url"
-    },
-    "scripts": {},
-    "dependencies": {
-        "@types/webidl-conversions": "*"
-    },
-    "typesPublisherContentHash": "c6cfac1bbd7b2ef315fdad11fc9bdb6a8f0ae2b1c3ff057cfca7bc9880eeaa9d",
-    "typeScriptVersion": "4.7"
+	"name": "ansi-styles",
+	"version": "4.3.0",
+	"description": "ANSI escape codes for styling strings in the terminal",
+	"license": "MIT",
+	"repository": "chalk/ansi-styles",
+	"funding": "https://github.com/chalk/ansi-styles?sponsor=1",
+	"author": {
+		"name": "Sindre Sorhus",
+		"email": "sindresorhus@gmail.com",
+		"url": "sindresorhus.com"
+	},
+	"engines": {
+		"node": ">=8"
+	},
+	"scripts": {
+		"test": "xo && ava && tsd",
+		"screenshot": "svg-term --command='node screenshot' --out=screenshot.svg --padding=3 --width=55 --height=3 --at=1000 --no-cursor"
+	},
+	"files": [
+		"index.js",
+		"index.d.ts"
+	],
+	"keywords": [
+		"ansi",
+		"styles",
+		"color",
+		"colour",
+		"colors",
+		"terminal",
+		"console",
+		"cli",
+		"string",
+		"tty",
+		"escape",
+		"formatting",
+		"rgb",
+		"256",
+		"shell",
+		"xterm",
+		"log",
+		"logging",
+		"command-line",
+		"text"
+	],
+	"dependencies": {
+		"color-convert": "^2.0.1"
+	},
+	"devDependencies": {
+		"@types/color-convert": "^1.9.0",
+		"ava": "^2.3.0",
+		"svg-term-cli": "^2.1.1",
+		"tsd": "^0.11.0",
+		"xo": "^0.25.3"
+	}
 }

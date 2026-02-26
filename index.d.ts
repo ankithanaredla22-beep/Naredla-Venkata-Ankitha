@@ -1,169 +1,345 @@
-/// <reference lib="es2020"/>
-/** https://url.spec.whatwg.org/#url-representation */
-export interface URLRecord {
-    scheme: string;
-    username: string;
-    password: string;
-    host: string | number | IPv6Address | null;
-    port: number | null;
-    path: string | string[];
-    query: string | null;
-    fragment: string | null;
+declare type CSSColor =
+	| 'aliceblue'
+	| 'antiquewhite'
+	| 'aqua'
+	| 'aquamarine'
+	| 'azure'
+	| 'beige'
+	| 'bisque'
+	| 'black'
+	| 'blanchedalmond'
+	| 'blue'
+	| 'blueviolet'
+	| 'brown'
+	| 'burlywood'
+	| 'cadetblue'
+	| 'chartreuse'
+	| 'chocolate'
+	| 'coral'
+	| 'cornflowerblue'
+	| 'cornsilk'
+	| 'crimson'
+	| 'cyan'
+	| 'darkblue'
+	| 'darkcyan'
+	| 'darkgoldenrod'
+	| 'darkgray'
+	| 'darkgreen'
+	| 'darkgrey'
+	| 'darkkhaki'
+	| 'darkmagenta'
+	| 'darkolivegreen'
+	| 'darkorange'
+	| 'darkorchid'
+	| 'darkred'
+	| 'darksalmon'
+	| 'darkseagreen'
+	| 'darkslateblue'
+	| 'darkslategray'
+	| 'darkslategrey'
+	| 'darkturquoise'
+	| 'darkviolet'
+	| 'deeppink'
+	| 'deepskyblue'
+	| 'dimgray'
+	| 'dimgrey'
+	| 'dodgerblue'
+	| 'firebrick'
+	| 'floralwhite'
+	| 'forestgreen'
+	| 'fuchsia'
+	| 'gainsboro'
+	| 'ghostwhite'
+	| 'gold'
+	| 'goldenrod'
+	| 'gray'
+	| 'green'
+	| 'greenyellow'
+	| 'grey'
+	| 'honeydew'
+	| 'hotpink'
+	| 'indianred'
+	| 'indigo'
+	| 'ivory'
+	| 'khaki'
+	| 'lavender'
+	| 'lavenderblush'
+	| 'lawngreen'
+	| 'lemonchiffon'
+	| 'lightblue'
+	| 'lightcoral'
+	| 'lightcyan'
+	| 'lightgoldenrodyellow'
+	| 'lightgray'
+	| 'lightgreen'
+	| 'lightgrey'
+	| 'lightpink'
+	| 'lightsalmon'
+	| 'lightseagreen'
+	| 'lightskyblue'
+	| 'lightslategray'
+	| 'lightslategrey'
+	| 'lightsteelblue'
+	| 'lightyellow'
+	| 'lime'
+	| 'limegreen'
+	| 'linen'
+	| 'magenta'
+	| 'maroon'
+	| 'mediumaquamarine'
+	| 'mediumblue'
+	| 'mediumorchid'
+	| 'mediumpurple'
+	| 'mediumseagreen'
+	| 'mediumslateblue'
+	| 'mediumspringgreen'
+	| 'mediumturquoise'
+	| 'mediumvioletred'
+	| 'midnightblue'
+	| 'mintcream'
+	| 'mistyrose'
+	| 'moccasin'
+	| 'navajowhite'
+	| 'navy'
+	| 'oldlace'
+	| 'olive'
+	| 'olivedrab'
+	| 'orange'
+	| 'orangered'
+	| 'orchid'
+	| 'palegoldenrod'
+	| 'palegreen'
+	| 'paleturquoise'
+	| 'palevioletred'
+	| 'papayawhip'
+	| 'peachpuff'
+	| 'peru'
+	| 'pink'
+	| 'plum'
+	| 'powderblue'
+	| 'purple'
+	| 'rebeccapurple'
+	| 'red'
+	| 'rosybrown'
+	| 'royalblue'
+	| 'saddlebrown'
+	| 'salmon'
+	| 'sandybrown'
+	| 'seagreen'
+	| 'seashell'
+	| 'sienna'
+	| 'silver'
+	| 'skyblue'
+	| 'slateblue'
+	| 'slategray'
+	| 'slategrey'
+	| 'snow'
+	| 'springgreen'
+	| 'steelblue'
+	| 'tan'
+	| 'teal'
+	| 'thistle'
+	| 'tomato'
+	| 'turquoise'
+	| 'violet'
+	| 'wheat'
+	| 'white'
+	| 'whitesmoke'
+	| 'yellow'
+	| 'yellowgreen';
+
+declare namespace ansiStyles {
+	interface ColorConvert {
+		/**
+		The RGB color space.
+
+		@param red - (`0`-`255`)
+		@param green - (`0`-`255`)
+		@param blue - (`0`-`255`)
+		*/
+		rgb(red: number, green: number, blue: number): string;
+
+		/**
+		The RGB HEX color space.
+
+		@param hex - A hexadecimal string containing RGB data.
+		*/
+		hex(hex: string): string;
+
+		/**
+		@param keyword - A CSS color name.
+		*/
+		keyword(keyword: CSSColor): string;
+
+		/**
+		The HSL color space.
+
+		@param hue - (`0`-`360`)
+		@param saturation - (`0`-`100`)
+		@param lightness - (`0`-`100`)
+		*/
+		hsl(hue: number, saturation: number, lightness: number): string;
+
+		/**
+		The HSV color space.
+
+		@param hue - (`0`-`360`)
+		@param saturation - (`0`-`100`)
+		@param value - (`0`-`100`)
+		*/
+		hsv(hue: number, saturation: number, value: number): string;
+
+		/**
+		The HSV color space.
+
+		@param hue - (`0`-`360`)
+		@param whiteness - (`0`-`100`)
+		@param blackness - (`0`-`100`)
+		*/
+		hwb(hue: number, whiteness: number, blackness: number): string;
+
+		/**
+		Use a [4-bit unsigned number](https://en.wikipedia.org/wiki/ANSI_escape_code#3/4-bit) to set text color.
+		*/
+		ansi(ansi: number): string;
+
+		/**
+		Use an [8-bit unsigned number](https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit) to set text color.
+		*/
+		ansi256(ansi: number): string;
+	}
+
+	interface CSPair {
+		/**
+		The ANSI terminal control sequence for starting this style.
+		*/
+		readonly open: string;
+
+		/**
+		The ANSI terminal control sequence for ending this style.
+		*/
+		readonly close: string;
+	}
+
+	interface ColorBase {
+		readonly ansi: ColorConvert;
+		readonly ansi256: ColorConvert;
+		readonly ansi16m: ColorConvert;
+
+		/**
+		The ANSI terminal control sequence for ending this color.
+		*/
+		readonly close: string;
+	}
+
+	interface Modifier {
+		/**
+		Resets the current color chain.
+		*/
+		readonly reset: CSPair;
+
+		/**
+		Make text bold.
+		*/
+		readonly bold: CSPair;
+
+		/**
+		Emitting only a small amount of light.
+		*/
+		readonly dim: CSPair;
+
+		/**
+		Make text italic. (Not widely supported)
+		*/
+		readonly italic: CSPair;
+
+		/**
+		Make text underline. (Not widely supported)
+		*/
+		readonly underline: CSPair;
+
+		/**
+		Inverse background and foreground colors.
+		*/
+		readonly inverse: CSPair;
+
+		/**
+		Prints the text, but makes it invisible.
+		*/
+		readonly hidden: CSPair;
+
+		/**
+		Puts a horizontal line through the center of the text. (Not widely supported)
+		*/
+		readonly strikethrough: CSPair;
+	}
+
+	interface ForegroundColor {
+		readonly black: CSPair;
+		readonly red: CSPair;
+		readonly green: CSPair;
+		readonly yellow: CSPair;
+		readonly blue: CSPair;
+		readonly cyan: CSPair;
+		readonly magenta: CSPair;
+		readonly white: CSPair;
+
+		/**
+		Alias for `blackBright`.
+		*/
+		readonly gray: CSPair;
+
+		/**
+		Alias for `blackBright`.
+		*/
+		readonly grey: CSPair;
+
+		readonly blackBright: CSPair;
+		readonly redBright: CSPair;
+		readonly greenBright: CSPair;
+		readonly yellowBright: CSPair;
+		readonly blueBright: CSPair;
+		readonly cyanBright: CSPair;
+		readonly magentaBright: CSPair;
+		readonly whiteBright: CSPair;
+	}
+
+	interface BackgroundColor {
+		readonly bgBlack: CSPair;
+		readonly bgRed: CSPair;
+		readonly bgGreen: CSPair;
+		readonly bgYellow: CSPair;
+		readonly bgBlue: CSPair;
+		readonly bgCyan: CSPair;
+		readonly bgMagenta: CSPair;
+		readonly bgWhite: CSPair;
+
+		/**
+		Alias for `bgBlackBright`.
+		*/
+		readonly bgGray: CSPair;
+
+		/**
+		Alias for `bgBlackBright`.
+		*/
+		readonly bgGrey: CSPair;
+
+		readonly bgBlackBright: CSPair;
+		readonly bgRedBright: CSPair;
+		readonly bgGreenBright: CSPair;
+		readonly bgYellowBright: CSPair;
+		readonly bgBlueBright: CSPair;
+		readonly bgCyanBright: CSPair;
+		readonly bgMagentaBright: CSPair;
+		readonly bgWhiteBright: CSPair;
+	}
 }
 
-/** https://url.spec.whatwg.org/#concept-ipv6 */
-export type IPv6Address = [number, number, number, number, number, number, number, number];
+declare const ansiStyles: {
+	readonly modifier: ansiStyles.Modifier;
+	readonly color: ansiStyles.ForegroundColor & ansiStyles.ColorBase;
+	readonly bgColor: ansiStyles.BackgroundColor & ansiStyles.ColorBase;
+	readonly codes: ReadonlyMap<number, number>;
+} & ansiStyles.BackgroundColor & ansiStyles.ForegroundColor & ansiStyles.Modifier;
 
-/** https://url.spec.whatwg.org/#url-class */
-export class URL {
-    constructor(url: string, base?: string | URL);
-
-    get href(): string;
-    set href(V: string);
-
-    get origin(): string;
-
-    get protocol(): string;
-    set protocol(V: string);
-
-    get username(): string;
-    set username(V: string);
-
-    get password(): string;
-    set password(V: string);
-
-    get host(): string;
-    set host(V: string);
-
-    get hostname(): string;
-    set hostname(V: string);
-
-    get port(): string;
-    set port(V: string);
-
-    get pathname(): string;
-    set pathname(V: string);
-
-    get search(): string;
-    set search(V: string);
-
-    get searchParams(): URLSearchParams;
-
-    get hash(): string;
-    set hash(V: string);
-
-    toJSON(): string;
-
-    readonly [Symbol.toStringTag]: "URL";
-}
-
-/** https://url.spec.whatwg.org/#interface-urlsearchparams */
-export class URLSearchParams {
-    constructor(
-        init?:
-            | ReadonlyArray<readonly [name: string, value: string]>
-            | Iterable<readonly [name: string, value: string]>
-            | { readonly [name: string]: string }
-            | string,
-    );
-
-    append(name: string, value: string): void;
-    delete(name: string): void;
-    get(name: string): string | null;
-    getAll(name: string): string[];
-    has(name: string): boolean;
-    set(name: string, value: string): void;
-    sort(): void;
-
-    keys(): IterableIterator<string>;
-    values(): IterableIterator<string>;
-    entries(): IterableIterator<[name: string, value: string]>;
-    forEach<THIS_ARG = void>(
-        callback: (this: THIS_ARG, value: string, name: string, searchParams: this) => void,
-        thisArg?: THIS_ARG,
-    ): void;
-
-    readonly [Symbol.toStringTag]: "URLSearchParams";
-    [Symbol.iterator](): IterableIterator<[name: string, value: string]>;
-}
-
-/** https://url.spec.whatwg.org/#concept-url-parser */
-export function parseURL(input: string, options?: { readonly baseURL?: URLRecord | undefined }): URLRecord | null;
-
-/** https://url.spec.whatwg.org/#concept-basic-url-parser */
-export function basicURLParse(
-    input: string,
-    options?: {
-        baseURL?: URLRecord | undefined;
-        url?: URLRecord | undefined;
-        stateOverride?: StateOverride | undefined;
-    },
-): URLRecord | null;
-
-/** https://url.spec.whatwg.org/#scheme-start-state */
-export type StateOverride =
-    | "scheme start"
-    | "scheme"
-    | "no scheme"
-    | "special relative or authority"
-    | "path or authority"
-    | "relative"
-    | "relative slash"
-    | "special authority slashes"
-    | "special authority ignore slashes"
-    | "authority"
-    | "host"
-    | "hostname"
-    | "port"
-    | "file"
-    | "file slash"
-    | "file host"
-    | "path start"
-    | "path"
-    | "opaque path"
-    | "query"
-    | "fragment";
-
-/** https://url.spec.whatwg.org/#concept-url-serializer */
-export function serializeURL(urlRecord: URLRecord, excludeFragment?: boolean): string;
-
-/** https://url.spec.whatwg.org/#concept-host-serializer */
-export function serializeHost(host: string | number | IPv6Address): string;
-
-/** https://url.spec.whatwg.org/#url-path-serializer */
-export function serializePath(urlRecord: URLRecord): string;
-
-/** https://url.spec.whatwg.org/#serialize-an-integer */
-export function serializeInteger(number: number): string;
-
-/** https://html.spec.whatwg.org#ascii-serialisation-of-an-origin */
-export function serializeURLOrigin(urlRecord: URLRecord): string;
-
-/** https://url.spec.whatwg.org/#set-the-username */
-export function setTheUsername(urlRecord: URLRecord, username: string): void;
-
-/** https://url.spec.whatwg.org/#set-the-password */
-export function setThePassword(urlRecord: URLRecord, password: string): void;
-
-/** https://url.spec.whatwg.org/#url-opaque-path */
-export function hasAnOpaquePath(urlRecord: URLRecord): boolean;
-
-/** https://url.spec.whatwg.org/#cannot-have-a-username-password-port */
-export function cannotHaveAUsernamePasswordPort(urlRecord: URLRecord): boolean;
-
-/** https://url.spec.whatwg.org/#percent-decode */
-export function percentDecodeBytes(buffer: TypedArray): Uint8Array;
-
-/** https://url.spec.whatwg.org/#string-percent-decode */
-export function percentDecodeString(string: string): Uint8Array;
-
-export type TypedArray =
-    | Uint8Array
-    | Uint8ClampedArray
-    | Uint16Array
-    | Uint32Array
-    | Int8Array
-    | Int16Array
-    | Int32Array
-    | Float32Array
-    | Float64Array;
+export = ansiStyles;
