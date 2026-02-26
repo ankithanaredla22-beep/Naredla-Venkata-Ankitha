@@ -1,24 +1,33 @@
 {
-  "name": "memory-pager",
-  "version": "1.5.0",
-  "description": "Access memory using small fixed sized buffers",
-  "main": "index.js",
-  "dependencies": {},
-  "devDependencies": {
-    "standard": "^9.0.0",
-    "tape": "^4.6.3"
-  },
-  "scripts": {
-    "test": "standard && tape test.js"
+  "author": "Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me)",
+  "name": "minimatch",
+  "description": "a glob matcher in javascript",
+  "version": "3.1.2",
+  "publishConfig": {
+    "tag": "v3-legacy"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mafintosh/memory-pager.git"
+    "url": "git://github.com/isaacs/minimatch.git"
   },
-  "author": "Mathias Buus (@mafintosh)",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/mafintosh/memory-pager/issues"
+  "main": "minimatch.js",
+  "scripts": {
+    "test": "tap",
+    "preversion": "npm test",
+    "postversion": "npm publish",
+    "postpublish": "git push origin --all; git push origin --tags"
   },
-  "homepage": "https://github.com/mafintosh/memory-pager"
+  "engines": {
+    "node": "*"
+  },
+  "dependencies": {
+    "brace-expansion": "^1.1.7"
+  },
+  "devDependencies": {
+    "tap": "^15.1.6"
+  },
+  "license": "ISC",
+  "files": [
+    "minimatch.js"
+  ]
 }
